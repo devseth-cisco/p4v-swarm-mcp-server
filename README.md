@@ -5,7 +5,7 @@ Two MCP (Model Context Protocol) servers that give your Agentic IDE full Perforc
 | Server | What it does |
 |--------|-------------|
 | **perforce-p4** | Official Perforce MCP server — query/modify files, changelists, shelves, workspaces, jobs, reviews |
-| **p4-workflow** | Custom one-click workflow — create CLs with Cisco template, checkout files, shelve, raise Swarm reviews, add comments |
+| **p4-workflow** | Custom one-click workflow — create CLs with Cisco template, checkout files, shelve, raise Swarm reviews, fetch diffs from any review, add comments |
 
 ---
 
@@ -223,7 +223,42 @@ Create a changelist for bug CSCxx12345 on workspace 7_4_1_MAIN
 | `checkout_file` | Open file(s) for edit in a CL (`p4 edit`) |
 | `update_review` | Re-shelve code changes — Swarm auto-versions |
 | `raise_review` | Shelve + create a new Swarm review (one call) |
+| `get_review_diff` | Fetch full diff + metadata for **any** Swarm review by ID |
+| `get_review_info` | Fetch metadata + file list for any Swarm review (no diff body) |
 | `add_review_comment` | Add a comment to a Swarm review |
+
+#### Fetching Diffs from Any Review
+
+You can read any colleague's review without opening a browser:
+
+```
+# Full diff (code changes, max 600 lines by default)
+get_review_diff(4960267)
+
+# Just metadata + file list (fast, no diff body)
+get_review_info(4960267)
+
+# Increase line limit for large reviews
+get_review_diff(4960267, max_lines=1200)
+```
+
+Example output:
+```
+Review:      https://sp4-fp-swarm.cisco.com/reviews/4960267
+Author:      baveerap
+State:       archived
+Description: Fixes: baveerap CSCws05587
+Changelists: 4960264, 4960268, ...
+────────────────────────────────────────────────────────────
+=== CL 4960264 ===
+Change 4960264 by baveerap@baveerap_IMS_10_5_MAIN ...
+
+--- //depot/.../fix_blob_type_affinity.py   (before)
++++ //depot/.../fix_blob_type_affinity.py   (shelved)
+@@ -1,5 +1,12 @@
++import sqlite3
+ ...
+```
 
 ---
 
@@ -257,6 +292,13 @@ The p4-workflow server auto-detects the workspace from the changelist. Works wit
 
 **"No open files found in changelist"?**
 - Use `checkout_file` tool first before `update_review`
+
+**`get_review_diff` returns "Swarm API returned 404"?**
+- Double-check the review ID exists at your Swarm URL
+- Ensure your P4 ticket is valid (`p4 login`) — the server uses it for Swarm auth
+
+**`get_review_diff` diff is truncated?**
+- Pass a higher `max_lines` value: `get_review_diff(4960267, max_lines=2000)`
 
 ---
 
