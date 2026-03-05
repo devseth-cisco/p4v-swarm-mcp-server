@@ -148,16 +148,24 @@ def _swarm_ticket() -> str:
 
 def _swarm(method: str, path: str, payload: dict) -> tuple[int, dict]:
     ticket = _swarm_ticket()
-    fn = httpx.post if method == "post" else httpx.patch
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        resp = fn(
-            f"{SWARM_API}/{path}",
-            auth=(P4_USER, ticket),
-            json=payload,
-            verify=False,
-            timeout=30,
-        )
+        if method == "get":
+            resp = httpx.get(
+                f"{SWARM_API}/{path}",
+                auth=(P4_USER, ticket),
+                verify=False,
+                timeout=30,
+            )
+        else:
+            fn = httpx.post if method == "post" else httpx.patch
+            resp = fn(
+                f"{SWARM_API}/{path}",
+                auth=(P4_USER, ticket),
+                json=payload,
+                verify=False,
+                timeout=30,
+            )
     return resp.status_code, resp.json() if resp.content else {}
 
 
@@ -329,6 +337,91 @@ def raise_review(
         )
 
     raise RuntimeError(f"Swarm API returned {status}: {body}")
+
+
+@mcp.tool()
+def get_review_diff(review_id: int, max_lines: int = 600) -> str:
+    """Fetch the diff and metadata for any Swarm review.
+
+    Retrieves review info from Swarm (title, author, state, CLs) then runs
+    p4 describe -S on each shelved changelist to get the actual file diffs.
+
+    Args:
+        review_id: Swarm review ID (e.g. 4960267)
+        max_lines: Truncate diff output at this many lines (default 600)
+    """
+    status, body = _swarm("get", f"reviews/{review_id}", {})
+    if status != 200:
+        raise RuntimeError(f"Swarm API returned {status} for review {review_id}: {body}")
+
+    review   = body["review"]
+    author   = review.get("author", "?")
+    state    = review.get("state", "?")
+    desc     = (review.get("description") or "").strip().splitlines()[0] if review.get("description") else ""
+    changes  = review.get("changes") or review.get("versions", [{}])[-1].get("change", [])
+    if isinstance(changes, int):
+        changes = [changes]
+
+    header = (
+        f"Review:      {SWARM_URL}/reviews/{review_id}\n"
+        f"Author:      {author}\n"
+        f"State:       {state}\n"
+        f"Description: {desc}\n"
+        f"Changelists: {', '.join(str(c) for c in changes)}\n"
+        f"{'─' * 60}\n"
+    )
+
+    diff_parts = []
+    for cl in changes:
+        try:
+            out = _p4("describe", "-S", "-du", str(cl))
+            diff_parts.append(f"=== CL {cl} ===\n{out}")
+        except RuntimeError as e:
+            diff_parts.append(f"=== CL {cl} === (p4 describe failed: {e})")
+
+    full_diff = "\n".join(diff_parts)
+    lines = full_diff.splitlines()
+    if len(lines) > max_lines:
+        full_diff = "\n".join(lines[:max_lines]) + f"\n\n... (truncated at {max_lines} lines, {len(lines)} total)"
+
+    return header + full_diff
+
+
+@mcp.tool()
+def get_review_info(review_id: int) -> str:
+    """Fetch summary info for any Swarm review — no diff, just metadata and file list.
+
+    Args:
+        review_id: Swarm review ID (e.g. 4960267)
+    """
+    status, body = _swarm("get", f"reviews/{review_id}", {})
+    if status != 200:
+        raise RuntimeError(f"Swarm API returned {status}: {body}")
+
+    review  = body["review"]
+    author  = review.get("author", "?")
+    state   = review.get("state", "?")
+    desc    = (review.get("description") or "").strip()
+    changes = review.get("changes") or []
+    if isinstance(changes, int):
+        changes = [changes]
+
+    files_out = ""
+    for cl in changes:
+        try:
+            out = _p4("describe", "-S", "-s", str(cl))
+            files_out += f"\n=== Files in CL {cl} ===\n{out}\n"
+        except RuntimeError as e:
+            files_out += f"\n=== CL {cl} failed: {e} ===\n"
+
+    return (
+        f"Review:      {SWARM_URL}/reviews/{review_id}\n"
+        f"Author:      {author}\n"
+        f"State:       {state}\n"
+        f"CLs:         {', '.join(str(c) for c in changes)}\n\n"
+        f"Description:\n{desc}\n"
+        f"{files_out}"
+    )
 
 
 @mcp.tool()
