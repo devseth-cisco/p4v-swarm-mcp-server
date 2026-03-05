@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "perforce-p4": {
+      "command": "REPLACE_WITH_PATH_TO/bin/p4-mcp-start.sh",
+      "args": [
+        "--toolsets", "files", "changelists", "shelves", "workspaces", "jobs", "reviews"
+      ],
+      "env": {
+        "P4PORT": "ssl:REPLACE_WITH_YOUR_P4_SERVER:1666",
+        "P4USER": "REPLACE_WITH_YOUR_USERNAME",
+        "PATH": "REPLACE_WITH_YOUR_HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    },
+    "p4-workflow": {
+      "command": "python3",
+      "args": ["REPLACE_WITH_PATH_TO/bin/p4-workflow/server.py"],
+      "env": {
+        "PYTHONPATH": "REPLACE_WITH_PATH_TO/bin/p4-workflow",
+        "PATH": "REPLACE_WITH_YOUR_HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  }
+}
