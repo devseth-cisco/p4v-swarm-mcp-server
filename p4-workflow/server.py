@@ -256,20 +256,64 @@ def create_changelist(
 
 @mcp.tool()
 def checkout_file(
-    depot_path: str,
+    file_path: str,
     changelist_id: int,
 ) -> str:
-    """Open a depot file for edit in a specific changelist (p4 edit).
+    """Open a file for edit in a specific changelist (p4 edit).
 
-    The workspace is auto-detected from the changelist.
+    Accepts either a local filesystem path OR a depot path — auto-detects and
+    converts local paths to depot paths using 'p4 where' so you never need to
+    look up the depot path manually.
+
+    The workspace (P4CLIENT) is auto-detected from the changelist.
 
     Args:
-        depot_path:     Full depot path e.g. '//depot/firepower/ims/IMS_7_4_1_MAIN/src/...'
+        file_path:      Local path (e.g. /Users/you/Perforce/.../foo.pm)
+                        OR depot path (e.g. //depot/firepower/ims/.../foo.pm)
         changelist_id:  The changelist to open the file in
     """
     client = _client_for_cl(changelist_id)
+
+    # Auto-convert local path → depot path via p4 where
+    if not file_path.startswith("//"):
+        where_out = _p4("where", file_path, client=client)
+        depot_path = where_out.split()[0]
+    else:
+        depot_path = file_path
+
     _p4("edit", "-c", str(changelist_id), depot_path, client=client)
     return f"Opened {depot_path} for edit in CL {changelist_id} (workspace: {client})."
+
+
+@mcp.tool()
+def update_description(changelist_id: int, description: str) -> str:
+    """Update a changelist description with no character limit.
+
+    Uses 'p4 change -i' directly, bypassing the 2000-char restriction in the
+    official perforce-p4 MCP server. Use this for long descriptions with full
+    test cases, change details, etc.
+
+    Args:
+        changelist_id:  The Perforce changelist number
+        description:    Full description text (any length)
+    """
+    client = _client_for_cl(changelist_id)
+    spec = _p4("change", "-o", str(changelist_id), client=client)
+    indented = "\n".join(f"\t{line}" for line in description.splitlines())
+    new_spec = re.sub(
+        r"^Description:.*?(?=^\S|\Z)",
+        f"Description:\n{indented}\n\n",
+        spec,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    r = subprocess.run(
+        [P4_BIN, "change", "-i"],
+        input=new_spec, capture_output=True, text=True,
+        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER, "P4CLIENT": client},
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip())
+    return f"CL {changelist_id} description updated ({len(description)} chars)."
 
 
 @mcp.tool()
