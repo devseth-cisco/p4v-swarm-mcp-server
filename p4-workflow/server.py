@@ -27,6 +27,7 @@ import sys
 import os
 import re
 import subprocess
+import time
 import httpx
 import warnings
 
@@ -246,31 +247,51 @@ def _resolve_client(workspace: str | None) -> str:
 
 
 # ── Swarm helpers ────────────────────────────────────────────────────────────
-def _swarm_ticket() -> str:
-    return _p4("login", "-p")
+# Persistent HTTP client — reuses TCP connections across all Swarm calls.
+_http = httpx.Client(verify=False, timeout=30)
+
+# Ticket cache — p4 login -p is a subprocess; call it once per session, not per request.
+_TICKET_CACHE_TTL = 20 * 3600  # 20 hours (p4 tickets expire in 24h)
+_swarm_ticket_cache: dict = {"value": None, "expires_at": 0.0}
+
+
+def _swarm_ticket(force_refresh: bool = False) -> str:
+    """Return a cached Swarm ticket; refresh only when expired or forced."""
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _swarm_ticket_cache["value"]
+        and now < _swarm_ticket_cache["expires_at"]
+    ):
+        return _swarm_ticket_cache["value"]
+    ticket = _p4("login", "-p")
+    _swarm_ticket_cache["value"] = ticket
+    _swarm_ticket_cache["expires_at"] = now + _TICKET_CACHE_TTL
+    return ticket
 
 
 def _swarm(method: str, path: str, payload: dict) -> tuple[int, dict]:
-    ticket = _swarm_ticket()
+    """Make a Swarm API call. Caches the ticket and retries once on 401."""
+    url = f"{SWARM_API}/{path}"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        if method == "get":
-            resp = httpx.get(
-                f"{SWARM_API}/{path}",
-                auth=(P4_USER, ticket),
-                verify=False,
-                timeout=30,
-            )
-        else:
-            fn = httpx.post if method == "post" else httpx.patch
-            resp = fn(
-                f"{SWARM_API}/{path}",
-                auth=(P4_USER, ticket),
-                json=payload,
-                verify=False,
-                timeout=30,
-            )
-    return resp.status_code, resp.json() if resp.content else {}
+        for attempt in range(2):
+            auth = (P4_USER, _swarm_ticket(force_refresh=(attempt > 0)))
+            if method == "get":
+                resp = _http.get(url, auth=auth)
+            elif method == "post":
+                resp = _http.post(url, auth=auth, json=payload)
+            else:
+                resp = _http.patch(url, auth=auth, json=payload)
+            # On 401, invalidate the cache and retry once with a fresh ticket
+            if resp.status_code == 401 and attempt == 0:
+                _swarm_ticket_cache["value"] = None
+                continue
+            return resp.status_code, resp.json() if resp.content else {}
+    raise RuntimeError(
+        "Swarm authentication failed after ticket refresh.\n"
+        "Run p4_login to re-authenticate."
+    )
 
 
 # ── MCP server ───────────────────────────────────────────────────────────────
