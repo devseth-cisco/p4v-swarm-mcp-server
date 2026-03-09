@@ -9,8 +9,13 @@ ONE-CLICK TOOLS:
   add_review_comment -- add a comment to a review
   checkout_file      -- open a file for edit in a changelist (p4 edit)
 
-All tools auto-detect the correct P4CLIENT from the changelist or workspace name.
-Works across ALL workspaces: 7_4_1_MAIN, IMS_7_7_MAIN, ims_10_10_MAIN, IMS_10_5_MAIN, etc.
+AUTH TOOLS (zero manual login):
+  p4_login           -- check ticket status; auto-refreshes from Keychain if stored
+  save_p4_password   -- one-time setup: store your P4 password in macOS Keychain
+
+AUTO-LOGIN:
+  Every p4 command auto-detects an expired ticket and silently re-authenticates
+  using the password stored in Keychain. Run save_p4_password once to enable this.
 
 Placeholders replaced by setup.sh:
   __P4_BIN__    -> path to p4 CLI
@@ -28,13 +33,15 @@ import warnings
 sys.path.insert(0, os.path.dirname(__file__))
 from fastmcp import FastMCP
 
-# ── Config (update these for your environment) ─────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 P4_BIN    = "__P4_BIN__"
 P4_PORT   = "__P4PORT__"
 P4_USER   = "__P4USER__"
 
 SWARM_URL = "__SWARM_URL__"
 SWARM_API = f"{SWARM_URL}/api/v9"
+
+_KEYCHAIN_SERVICE = "p4-workflow"
 
 # Exact Cisco IMS changelist template
 _CL_TEMPLATE = """\
@@ -80,16 +87,111 @@ Review Link:
 Documentation:
 {documentation}"""
 
-# ── P4 helpers ──────────────────────────────────────────────────────────────
+# ── Keychain / auto-login helpers ────────────────────────────────────────────
+def _keychain_password() -> str | None:
+    """Read P4 password from macOS Keychain. Returns None if not stored."""
+    r = subprocess.run(
+        ["security", "find-generic-password", "-a", P4_USER, "-s", _KEYCHAIN_SERVICE, "-w"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def _ticket_valid() -> bool:
+    """Return True if the current P4 ticket is valid (non-expired)."""
+    r = subprocess.run(
+        [P4_BIN, "login", "-s"],
+        capture_output=True, text=True,
+        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER},
+    )
+    return r.returncode == 0
+
+
+def _ticket_status() -> str:
+    """Return human-readable ticket status string."""
+    r = subprocess.run(
+        [P4_BIN, "login", "-s"],
+        capture_output=True, text=True,
+        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER},
+    )
+    return r.stdout.strip() if r.returncode == 0 else (r.stderr or r.stdout).strip()
+
+
+def _do_login(password: str) -> bool:
+    """Log in with the given password. Returns True on success."""
+    r = subprocess.run(
+        [P4_BIN, "login"],
+        input=password, capture_output=True, text=True,
+        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER},
+    )
+    return r.returncode == 0
+
+
+def _auto_login() -> bool:
+    """Try to auto-login using the Keychain-stored password. Returns True on success."""
+    pwd = _keychain_password()
+    if not pwd:
+        return False
+    return _do_login(pwd)
+
+
+_TICKET_ERROR_SIGNALS = (
+    "ticket has expired",
+    "Your session has expired",
+    "Password invalid",
+    "P4PASSWD",
+    "password (P4PASSWD)",
+    "login required",
+)
+
+
+def _is_auth_error(msg: str) -> bool:
+    return any(s.lower() in msg.lower() for s in _TICKET_ERROR_SIGNALS)
+
+
+# ── P4 helpers ───────────────────────────────────────────────────────────────
 def _p4(*args: str, client: str | None = None) -> str:
     env = os.environ.copy()
     env["P4PORT"] = P4_PORT
     env["P4USER"] = P4_USER
     if client:
         env["P4CLIENT"] = client
+
     r = subprocess.run([P4_BIN] + list(args), capture_output=True, text=True, env=env)
+
     if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout).strip())
+        msg = (r.stderr or r.stdout).strip()
+
+        # Auto-retry once on expired ticket using Keychain password
+        if _is_auth_error(msg):
+            if _auto_login():
+                r2 = subprocess.run([P4_BIN] + list(args), capture_output=True, text=True, env=env)
+                if r2.returncode == 0:
+                    return r2.stdout.strip()
+                msg = (r2.stderr or r2.stdout).strip()
+
+            # Auto-login not configured or failed
+            pwd_stored = _keychain_password() is not None
+            if pwd_stored:
+                raise RuntimeError(
+                    "Perforce ticket expired and auto-login failed (wrong password stored?).\n"
+                    "Fix: run the save_p4_password tool to update your stored password,\n"
+                    "     or run `p4 login` in a terminal."
+                )
+            raise RuntimeError(
+                "Perforce ticket expired.\n"
+                "Quick fix: run the p4_login tool — it will guide you.\n"
+                "Permanent fix: run the save_p4_password tool once to enable auto-login."
+            )
+
+        if "Connect to server failed" in msg or "nodename nor servname" in msg:
+            raise RuntimeError(
+                f"Cannot reach Perforce server ({P4_PORT}).\n"
+                "Check your VPN connection and retry."
+            )
+
+        raise RuntimeError(msg)
+
     return r.stdout.strip()
 
 
@@ -105,7 +207,7 @@ def _opened_files(changelist_id: int, client: str) -> list[str]:
 
 
 def _shelve(changelist_id: int, client: str) -> str:
-    """Force-shelve all open files in a changelist, passing paths explicitly to avoid hangs."""
+    """Force-shelve all open files in a changelist."""
     files = _opened_files(changelist_id, client)
     if not files:
         raise RuntimeError(f"No open files found in changelist {changelist_id}")
@@ -117,8 +219,10 @@ def _client_for_cl(changelist_id: int) -> str:
     out = _p4("change", "-o", str(changelist_id))
     m = re.search(r"^Client:\t(\S+)", out, re.MULTILINE)
     if not m:
-        raise RuntimeError(f"Could not detect client for changelist {changelist_id}. "
-                           f"Output: {out[:200]}")
+        raise RuntimeError(
+            f"Could not detect client for changelist {changelist_id}.\n"
+            f"Output: {out[:200]}"
+        )
     return m.group(1)
 
 
@@ -141,7 +245,7 @@ def _resolve_client(workspace: str | None) -> str:
     return f"{P4_USER}_{workspace}"
 
 
-# ── Swarm helpers ───────────────────────────────────────────────────────────
+# ── Swarm helpers ────────────────────────────────────────────────────────────
 def _swarm_ticket() -> str:
     return _p4("login", "-p")
 
@@ -169,7 +273,7 @@ def _swarm(method: str, path: str, payload: dict) -> tuple[int, dict]:
     return resp.status_code, resp.json() if resp.content else {}
 
 
-# ── MCP server ──────────────────────────────────────────────────────────────
+# ── MCP server ───────────────────────────────────────────────────────────────
 mcp = FastMCP(
     "p4-workflow",
     instructions="""
@@ -180,12 +284,83 @@ Single source of truth for Perforce + Swarm workflow -- one tool per task:
   3. update_review      -> after saving code, push new version to Swarm (1 call)
   4. raise_review       -> first-time: shelve + create Swarm review (1 call)
   5. add_review_comment -> comment on a review
+  6. get_review_diff    -> fetch full diff + metadata for any Swarm review
+  7. get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
+  8. p4_login           -> check ticket status; auto-refreshes from Keychain if stored
+  9. save_p4_password   -> one-time: store P4 password in Keychain for auto-login
 
 Workspace (P4CLIENT) is always auto-detected.
+Tickets auto-refresh from Keychain — run save_p4_password once to enable.
 """,
 )
 
 
+# ── Auth tools ───────────────────────────────────────────────────────────────
+@mcp.tool()
+def p4_login() -> str:
+    """Check Perforce login status and auto-refresh the ticket if possible.
+
+    If a password is stored in Keychain (via save_p4_password), the ticket is
+    refreshed automatically. Otherwise returns instructions for manual login.
+    """
+    if _ticket_valid():
+        return f"Logged in. {_ticket_status()}"
+
+    # Ticket expired — try auto-login from Keychain
+    if _auto_login():
+        return f"Ticket expired — auto-renewed from Keychain. {_ticket_status()}"
+
+    # No Keychain entry
+    return (
+        "Perforce ticket expired and no password stored in Keychain.\n\n"
+        "Option 1 (recommended — enables auto-login forever):\n"
+        "  Run the save_p4_password tool with your P4 password.\n\n"
+        "Option 2 (manual, one session):\n"
+        "  Open a terminal and run: p4 login"
+    )
+
+
+@mcp.tool()
+def save_p4_password(password: str) -> str:
+    """Store your Perforce password in macOS Keychain for automatic login renewal.
+
+    This is a one-time setup. After this, every p4 command will silently
+    re-authenticate when the ticket expires — no more manual `p4 login`.
+
+    The password is stored securely in the macOS Keychain under the service
+    name 'p4-workflow' and is never written to disk or logs.
+
+    Args:
+        password: Your Perforce password (P4PASSWD)
+    """
+    # Remove any existing entry first (ignore errors)
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", P4_USER, "-s", _KEYCHAIN_SERVICE],
+        capture_output=True,
+    )
+
+    r = subprocess.run(
+        ["security", "add-generic-password", "-a", P4_USER, "-s", _KEYCHAIN_SERVICE, "-w", password],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"Failed to save to Keychain: {r.stderr.strip()}")
+
+    # Verify it works right now
+    if _do_login(password):
+        return (
+            f"Password saved to Keychain (service: {_KEYCHAIN_SERVICE}, account: {P4_USER}).\n"
+            f"Auto-login is now enabled — tickets will renew silently.\n"
+            f"Current status: {_ticket_status()}"
+        )
+
+    return (
+        f"Password saved to Keychain, but login failed — double-check your password.\n"
+        "Run save_p4_password again with the correct password."
+    )
+
+
+# ── Workflow tools ────────────────────────────────────────────────────────────
 @mcp.tool()
 def create_changelist(
     bug_id: str,
@@ -261,9 +436,8 @@ def checkout_file(
 ) -> str:
     """Open a file for edit in a specific changelist (p4 edit).
 
-    Accepts either a local filesystem path OR a depot path — auto-detects and
-    converts local paths to depot paths using 'p4 where' so you never need to
-    look up the depot path manually.
+    Accepts either a local filesystem path OR a depot path -- auto-detects and
+    converts local paths to depot paths using 'p4 where'.
 
     The workspace (P4CLIENT) is auto-detected from the changelist.
 
@@ -274,7 +448,6 @@ def checkout_file(
     """
     client = _client_for_cl(changelist_id)
 
-    # Auto-convert local path → depot path via p4 where
     if not file_path.startswith("//"):
         where_out = _p4("where", file_path, client=client)
         depot_path = where_out.split()[0]
@@ -290,8 +463,7 @@ def update_description(changelist_id: int, description: str) -> str:
     """Update a changelist description with no character limit.
 
     Uses 'p4 change -i' directly, bypassing the 2000-char restriction in the
-    official perforce-p4 MCP server. Use this for long descriptions with full
-    test cases, change details, etc.
+    official perforce-p4 MCP server.
 
     Args:
         changelist_id:  The Perforce changelist number
@@ -351,9 +523,7 @@ def raise_review(
         required_reviewers: Optional list of required reviewer usernames
     """
     client = _client_for_cl(changelist_id)
-
     _shelve(changelist_id, client)
-
     description = _desc_for_cl(changelist_id)
 
     payload: dict = {"change": changelist_id, "description": description}
@@ -385,10 +555,10 @@ def raise_review(
 
 @mcp.tool()
 def get_review_diff(review_id: int, max_lines: int = 600) -> str:
-    """Fetch the diff and metadata for any Swarm review.
+    """Fetch the full diff and metadata for any Swarm review.
 
-    Retrieves review info from Swarm (title, author, state, CLs) then runs
-    p4 describe -S on each shelved changelist to get the actual file diffs.
+    Retrieves review info from Swarm then runs p4 describe -S on each shelved
+    changelist to get the actual file diffs.
 
     Args:
         review_id: Swarm review ID (e.g. 4960267)
@@ -398,11 +568,11 @@ def get_review_diff(review_id: int, max_lines: int = 600) -> str:
     if status != 200:
         raise RuntimeError(f"Swarm API returned {status} for review {review_id}: {body}")
 
-    review   = body["review"]
-    author   = review.get("author", "?")
-    state    = review.get("state", "?")
-    desc     = (review.get("description") or "").strip().splitlines()[0] if review.get("description") else ""
-    changes  = review.get("changes") or review.get("versions", [{}])[-1].get("change", [])
+    review  = body["review"]
+    author  = review.get("author", "?")
+    state   = review.get("state", "?")
+    desc    = (review.get("description") or "").strip().splitlines()[0] if review.get("description") else ""
+    changes = review.get("changes") or review.get("versions", [{}])[-1].get("change", [])
     if isinstance(changes, int):
         changes = [changes]
 
@@ -433,7 +603,7 @@ def get_review_diff(review_id: int, max_lines: int = 600) -> str:
 
 @mcp.tool()
 def get_review_info(review_id: int) -> str:
-    """Fetch summary info for any Swarm review — no diff, just metadata and file list.
+    """Fetch summary info for any Swarm review -- no diff, just metadata and file list.
 
     Args:
         review_id: Swarm review ID (e.g. 4960267)
