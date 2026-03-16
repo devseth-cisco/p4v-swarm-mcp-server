@@ -7,6 +7,38 @@ Two MCP (Model Context Protocol) servers that give your Agentic IDE full Perforc
 | **perforce-p4** | Official Perforce MCP server — query/modify files, changelists, shelves, workspaces, jobs, reviews |
 | **p4-workflow** | Custom one-click workflow — create CLs with Cisco template, checkout files, shelve, raise Swarm reviews, fetch diffs from any review, add comments |
 
+## Quick Start (Zero Dependencies Required)
+
+```bash
+git clone <this-repo>
+cd p4v-swarm-mcp-server
+chmod +x setup.sh
+./setup.sh
+```
+
+**That's it.** The script installs everything from scratch on a bare macOS machine:
+
+| What | How |
+|------|-----|
+| Homebrew | Auto-installed if missing |
+| p4 CLI | Downloaded from Perforce CDN or installed via Homebrew |
+| Python 3 | `brew install python3` |
+| Node.js | `brew install node` (needed for sequential-thinking MCP) |
+| p4-mcp-server | Guided download (requires Perforce account) |
+| Python deps | `pip3 install fastmcp httpx` |
+| Auth | Interactive P4 login + macOS Keychain storage |
+| MCP config | Auto-generates `~/.cursor/mcp.json` |
+| AI rules | Installs workflow rules to `~/.cursor/rules/` |
+
+After setup, restart your IDE (Cmd+Q, reopen) and test:
+```
+List my pending changelists
+```
+
+> **Cursor AI users**: Open this repo in Cursor and ask "set this up" — the AI will identify and run the setup script automatically.
+
+---
+
 ## Architecture
 
 Scripts run directly from this repo — no copies, no placeholders, no deployment step.
@@ -25,96 +57,37 @@ All config is passed as **environment variables** via `mcp.json`. Edit once in m
     └── p4-workflow ──► this-repo/p4-workflow/server.py
                             ├── reads P4PORT, P4USER, P4_BIN, SWARM_URL from env
                             ├── auto-login from Keychain on every p4 command
-                            └── FastMCP server with 9 tools
+                            └── FastMCP server with 10 tools
 ```
 
 ---
 
-## Prerequisites
-
-| Tool | How to get it |
-|------|---------------|
-| **Agentic IDE** (Cursor/Windsurf/etc.) | https://cursor.sh |
-| **p4 CLI** | `brew install --cask perforce` (macOS) or https://www.perforce.com/downloads/helix-command-line-client-p4 |
-| **p4-mcp-server** | Download from https://www.perforce.com/downloads (search "MCP Server") — get the binary for your OS/arch |
-| **Python 3.10+** | `brew install python3` or https://python.org |
-| **Perforce account** | Your P4USER with login access to your P4PORT |
-| **Swarm access** | Your Swarm instance URL (e.g. `https://your-swarm.company.com`) |
-
----
-
-## Quick Start (Automated)
-
-```bash
-git clone <this-repo>
-cd p4v-swarm-mcp-server
-chmod +x setup.sh
-./setup.sh
-```
-
-The setup script will:
-1. Check for `p4` CLI and `p4-mcp-server`
-2. Install Python dependencies (`fastmcp`, `httpx`)
-3. Generate `~/.cursor/mcp.json` pointing to this repo's scripts
-
-Then restart your IDE.
-
----
-
-## Manual Setup
+## Manual Setup (if you prefer)
 
 ### Step 1: Install prerequisites
 
 ```bash
-brew install --cask perforce
-brew install python3
-pip3 install fastmcp httpx
-```
+# Homebrew
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-Download `p4-mcp-server` from Perforce and place it in `~/bin/p4-mcp-server*/p4-mcp-server`.
+# p4 CLI (pick one)
+brew install --cask perforce
+# OR download from https://www.perforce.com/downloads/helix-command-line-client-p4
+
+# Python 3, Node.js
+brew install python3 node
+
+# Python dependencies
+pip3 install fastmcp httpx
+
+# p4-mcp-server — download from https://www.perforce.com/downloads (search "Helix MCP Server")
+```
 
 ### Step 2: Configure mcp.json
 
-Create or edit `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "perforce-p4": {
-      "command": "/path/to/this-repo/perforce-p4/p4-mcp-start.sh",
-      "args": [
-        "--toolsets", "files", "changelists", "shelves", "workspaces", "jobs", "reviews"
-      ],
-      "env": {
-        "P4PORT": "ssl:YOUR-P4-SERVER:1666",
-        "P4USER": "YOUR_USERNAME",
-        "P4CLIENT_DEFAULT": "YOUR_USERNAME_YOUR_WORKSPACE",
-        "P4_BIN": "/path/to/p4",
-        "P4_MCP_SERVER": "/path/to/p4-mcp-server",
-        "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-      }
-    },
-    "p4-workflow": {
-      "command": "python3",
-      "args": ["/path/to/this-repo/p4-workflow/server.py"],
-      "env": {
-        "P4PORT": "ssl:YOUR-P4-SERVER:1666",
-        "P4USER": "YOUR_USERNAME",
-        "P4_BIN": "/path/to/p4",
-        "SWARM_URL": "https://YOUR-SWARM-SERVER",
-        "PYTHONPATH": "/path/to/this-repo/p4-workflow",
-        "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-      }
-    }
-  }
-}
-```
+Copy `mcp.json.template` to `~/.cursor/mcp.json` and replace all placeholders with your actual paths/values.
 
 ### Step 3: Restart your IDE and test
-
-```
-List my pending changelists
-```
 
 ---
 
@@ -185,15 +158,19 @@ List my pending changelists
 - Restart IDE completely (Cmd+Q, reopen)
 
 **"Connect to server failed"?**
+- Check VPN connection
 - Run `p4 login` in terminal to refresh your ticket
-- Verify P4PORT: `p4 -p ssl:YOUR-SERVER:1666 info`
 
 **p4-workflow "module not found"?**
 - Run `pip3 install fastmcp httpx`
-- Check `PYTHONPATH` in mcp.json points to the directory containing `server.py`
+- If that fails: `pip3 install --break-system-packages fastmcp httpx`
 
 **"P4PORT must be set" error?**
 - Ensure `env` block in mcp.json includes `P4PORT` and `P4USER`
+
+**p4 CLI not found after install?**
+- Check `~/bin/p4` exists and is executable
+- Or re-run `./setup.sh`
 
 ---
 
@@ -201,13 +178,17 @@ List my pending changelists
 
 ```
 p4v-swarm-mcp-server/
-  README.md              <- You are here
-  setup.sh               <- Automated installer (generates mcp.json)
-  mcp.json.template      <- Template for ~/.cursor/mcp.json
+  README.md                     <- You are here
+  setup.sh                      <- Zero-to-working installer
+  mcp.json.template             <- Template for manual ~/.cursor/mcp.json setup
   .gitignore
+  .cursor/rules/
+    setup-guide.mdc             <- Tells Cursor AI how to set up this repo
+  rules/
+    p4-workflow.mdc             <- Workflow rules (installed globally by setup.sh)
   perforce-p4/
-    p4-mcp-start.sh      <- Wrapper script for official MCP server
+    p4-mcp-start.sh             <- Wrapper script for official MCP server
   p4-workflow/
-    server.py             <- Custom workflow MCP server
-    requirements.txt      <- Python dependencies
+    server.py                   <- Custom workflow MCP server
+    requirements.txt            <- Python dependencies
 ```

@@ -86,20 +86,24 @@ def _p4_env(client: str | None = None) -> dict:
     return env
 
 
-def _ticket_valid() -> bool:
+def _check_ticket() -> tuple[bool, str]:
+    """Run `p4 login -s` once and return (is_valid, status_message)."""
     r = subprocess.run(
         [P4_BIN, "login", "-s"],
         capture_output=True, text=True, env=_p4_env(),
     )
-    return r.returncode == 0
+    msg = r.stdout.strip() if r.returncode == 0 else (r.stderr or r.stdout).strip()
+    return r.returncode == 0, msg
+
+
+def _ticket_valid() -> bool:
+    ok, _ = _check_ticket()
+    return ok
 
 
 def _ticket_status() -> str:
-    r = subprocess.run(
-        [P4_BIN, "login", "-s"],
-        capture_output=True, text=True, env=_p4_env(),
-    )
-    return r.stdout.strip() if r.returncode == 0 else (r.stderr or r.stdout).strip()
+    _, msg = _check_ticket()
+    return msg
 
 
 def _do_login(password: str) -> bool:
@@ -129,12 +133,14 @@ def _ensure_auth() -> None:
     Called at server startup and can be called before any critical operation.
     Never raises — logs warnings instead so the server still starts.
     """
-    if _ticket_valid():
-        log.info("Auth OK: %s", _ticket_status())
+    ok, status = _check_ticket()
+    if ok:
+        log.info("Auth OK: %s", status)
         return
     log.warning("Ticket expired at startup, attempting auto-login from Keychain...")
     if _auto_login():
-        log.info("Auto-login succeeded: %s", _ticket_status())
+        _, status = _check_ticket()
+        log.info("Auto-login succeeded: %s", status)
         return
     if _keychain_password() is None:
         log.warning(

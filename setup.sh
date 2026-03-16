@@ -2,19 +2,23 @@
 set -euo pipefail
 
 # ── Agentic IDE Perforce MCP Setup ────────────────────────────────────────────────
-# One-click installer: run this once and everything works.
+# TRUE zero-to-working installer. Handles everything from a bare macOS machine:
 #
-# What it does:
-#   1. Verifies prerequisites (p4 CLI, p4-mcp-server, Python, pip packages)
-#   2. Tests Perforce connectivity
-#   3. Authenticates and saves password to macOS Keychain (auto-login forever)
-#   4. Generates ~/.cursor/mcp.json pointing to this repo
-#   5. Installs Cursor rules for seamless P4 workflow
+#   1. Homebrew          (auto-install if missing)
+#   2. p4 CLI            (download from Perforce CDN, fallback to brew)
+#   3. Python 3          (brew install)
+#   4. Node.js           (brew install — needed for sequential-thinking MCP)
+#   5. p4-mcp-server     (guided download — Perforce auth required)
+#   6. Python deps       (fastmcp, httpx)
+#   7. Auth              (P4 login + macOS Keychain storage)
+#   8. ~/.cursor/mcp.json (generated, pointing to this repo)
+#   9. Cursor rules      (workflow guidance installed globally)
 #
 # Architecture: scripts run directly from this repo. All config is passed
 # as environment variables via mcp.json. No copies, no placeholders.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="$HOME/bin"
 BOLD='\033[1m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -57,26 +61,97 @@ echo ""
 read -rp "Proceed? (y/n): " CONFIRM
 [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && { echo "Aborted."; exit 0; }
 
-# ── Step 1: Prerequisites ────────────────────────────────────────────────────
-step "1/7" "Checking prerequisites..."
+mkdir -p "$INSTALL_DIR"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 1: Homebrew
+# ═══════════════════════════════════════════════════════════════════════════════
+step "1/9" "Checking Homebrew..."
+if command -v brew &>/dev/null; then
+    ok "Homebrew: $(brew --prefix)"
+else
+    warn "Homebrew not found — installing..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Add brew to current session PATH
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -x /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    ok "Homebrew installed"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 2: p4 CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+step "2/9" "Checking p4 CLI..."
 P4_BIN=""
 if command -v p4 &>/dev/null; then
     P4_BIN="$(command -v p4)"
-elif [[ -x "$HOME/bin/p4" ]]; then
-    P4_BIN="$HOME/bin/p4"
+elif [[ -x "$INSTALL_DIR/p4" ]]; then
+    P4_BIN="$INSTALL_DIR/p4"
 fi
 
 if [[ -z "$P4_BIN" ]]; then
-    fail "p4 CLI not found."
-    echo "  Install:  brew install --cask perforce"
-    echo "  Or:       https://www.perforce.com/downloads/helix-command-line-client-p4"
-    exit 1
+    warn "p4 CLI not found — installing..."
+    ARCH="$(uname -m)"
+    P4_URL=""
+    if [[ "$ARCH" == "arm64" ]]; then
+        P4_URL="https://cdist2.perforce.com/perforce/r24.2/bin.macosx13arm64/p4"
+    else
+        P4_URL="https://cdist2.perforce.com/perforce/r24.2/bin.macosx13x86_64/p4"
+    fi
+    if curl -fsSL "$P4_URL" -o "$INSTALL_DIR/p4" 2>/dev/null; then
+        chmod +x "$INSTALL_DIR/p4"
+        P4_BIN="$INSTALL_DIR/p4"
+        ok "p4 CLI downloaded to $P4_BIN"
+    else
+        warn "Direct download failed. Trying Homebrew..."
+        brew install --cask perforce 2>/dev/null || true
+        if command -v p4 &>/dev/null; then
+            P4_BIN="$(command -v p4)"
+            ok "p4 CLI: $P4_BIN"
+        else
+            fail "Could not install p4 CLI. Install manually:"
+            echo "    brew install --cask perforce"
+            echo "    OR: https://www.perforce.com/downloads/helix-command-line-client-p4"
+            exit 1
+        fi
+    fi
+else
+    ok "p4 CLI: $P4_BIN"
 fi
-ok "p4 CLI: $P4_BIN"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 3: Python 3
+# ═══════════════════════════════════════════════════════════════════════════════
+step "3/9" "Checking Python 3..."
+if command -v python3 &>/dev/null; then
+    ok "Python: $(python3 --version 2>&1)"
+else
+    warn "Python3 not found — installing via Homebrew..."
+    brew install python3
+    ok "Python: $(python3 --version 2>&1)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 4: Node.js (for npx / sequential-thinking MCP)
+# ═══════════════════════════════════════════════════════════════════════════════
+step "4/9" "Checking Node.js..."
+if command -v npx &>/dev/null; then
+    ok "Node.js: $(node --version 2>&1)"
+else
+    warn "Node.js not found — installing via Homebrew..."
+    brew install node
+    ok "Node.js: $(node --version 2>&1)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 5: p4-mcp-server binary
+# ═══════════════════════════════════════════════════════════════════════════════
+step "5/9" "Checking p4-mcp-server..."
 P4_MCP_BIN=""
-for dir in "$HOME"/bin/p4-mcp-server*; do
+for dir in "$INSTALL_DIR"/p4-mcp-server*; do
     if [[ -x "$dir/p4-mcp-server" ]]; then
         P4_MCP_BIN="$dir/p4-mcp-server"
         break
@@ -84,46 +159,58 @@ for dir in "$HOME"/bin/p4-mcp-server*; do
 done
 
 if [[ -z "$P4_MCP_BIN" ]]; then
-    warn "p4-mcp-server not found in ~/bin/"
-    echo "  Download from: https://www.perforce.com/downloads (search 'Helix MCP Server')"
-    read -rp "  Enter full path to p4-mcp-server binary (or 'skip'): " MCP_PATH
-    if [[ "$MCP_PATH" == "skip" ]]; then
-        warn "Skipping perforce-p4 server. You can configure it later."
-    elif [[ -x "$MCP_PATH" ]]; then
+    warn "p4-mcp-server not found."
+    echo ""
+    echo "  The Perforce MCP Server binary must be downloaded manually"
+    echo "  (Perforce requires authentication for this download)."
+    echo ""
+    echo "  1. Go to: https://www.perforce.com/downloads"
+    echo "  2. Search for 'Helix MCP Server'"
+    echo "  3. Download the macOS binary for your architecture"
+    echo "  4. Extract to: $INSTALL_DIR/p4-mcp-server/"
+    echo ""
+    read -rp "  Path to p4-mcp-server binary (or Enter to skip): " MCP_PATH
+    if [[ -n "$MCP_PATH" && -x "$MCP_PATH" ]]; then
         P4_MCP_BIN="$MCP_PATH"
         ok "p4-mcp-server: $P4_MCP_BIN"
+    elif [[ -n "$MCP_PATH" ]]; then
+        warn "Not found or not executable at $MCP_PATH. Skipping."
+        warn "The p4-workflow server will still work. perforce-p4 needs this binary."
     else
-        warn "Not found at $MCP_PATH. Skipping perforce-p4."
+        warn "Skipped. p4-workflow will work. perforce-p4 needs this binary."
     fi
 else
     ok "p4-mcp-server: $P4_MCP_BIN"
 fi
 
-if ! command -v python3 &>/dev/null; then
-    fail "Python3 not found. Install: brew install python3"
-    exit 1
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 6: Python dependencies
+# ═══════════════════════════════════════════════════════════════════════════════
+step "6/9" "Installing Python dependencies..."
+PIP_ARGS=(--quiet -r "$SCRIPT_DIR/p4-workflow/requirements.txt")
+if pip3 install "${PIP_ARGS[@]}" 2>/dev/null; then
+    ok "fastmcp + httpx installed"
+else
+    warn "Standard pip install failed, retrying with --break-system-packages..."
+    pip3 install --break-system-packages "${PIP_ARGS[@]}"
+    ok "fastmcp + httpx installed"
 fi
-ok "Python: $(python3 --version 2>&1)"
 
-# ── Step 2: Python dependencies ──────────────────────────────────────────────
-step "2/7" "Installing Python dependencies..."
-pip3 install --quiet -r "$SCRIPT_DIR/p4-workflow/requirements.txt" 2>&1 | tail -1
-ok "fastmcp + httpx installed"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 7: Authenticate + Keychain
+# ═══════════════════════════════════════════════════════════════════════════════
+step "7/9" "Setting up authentication..."
 
-# ── Step 3: Test Perforce connectivity ───────────────────────────────────────
-step "3/7" "Testing Perforce connectivity..."
 export P4PORT P4USER
+KEYCHAIN_SERVICE="p4-workflow"
+NEED_LOGIN=true
+
+echo "  Testing connectivity to $P4PORT..."
 if "$P4_BIN" -p "$P4PORT" -u "$P4USER" info &>/dev/null; then
     ok "Connected to $P4PORT"
 else
-    warn "Cannot reach $P4PORT — check VPN. Setup will continue."
+    warn "Cannot reach $P4PORT — check VPN. Auth setup will continue."
 fi
-
-# ── Step 4: Authenticate + save to Keychain ──────────────────────────────────
-step "4/7" "Setting up authentication (Keychain auto-login)..."
-
-KEYCHAIN_SERVICE="p4-workflow"
-NEED_LOGIN=true
 
 if "$P4_BIN" login -s &>/dev/null; then
     ok "Already logged in: $("$P4_BIN" login -s 2>&1 | head -1)"
@@ -149,8 +236,8 @@ fi
 if [[ "$KC_EXISTS" == "false" ]]; then
     echo ""
     echo "  To enable permanent auto-login, enter your Perforce password."
-    echo "  It will be stored in macOS Keychain (secure, never on disk)."
-    echo "  Press Enter to skip (you'll need to run 'p4 login' manually)."
+    echo "  It will be stored in macOS Keychain (secure, never written to disk)."
+    echo "  Press Enter to skip (you can use save_p4_password tool later)."
     echo ""
     read -rsp "  Perforce password: " P4_PASS
     echo ""
@@ -167,25 +254,24 @@ if [[ "$KC_EXISTS" == "false" ]]; then
             ok "Logged in successfully"
             NEED_LOGIN=false
         else
-            warn "Login failed — check your password. You can fix this later."
+            warn "Login failed — check your password. You can fix this later with save_p4_password tool."
         fi
     else
-        warn "Skipped Keychain setup. Run save_p4_password tool or 'p4 login' to authenticate."
+        warn "Skipped. Use save_p4_password tool or 'p4 login' after setup."
     fi
 fi
 
 if [[ "$NEED_LOGIN" == "true" ]]; then
-    warn "Not logged in. Run 'p4 login' or use the save_p4_password tool after setup."
+    warn "Not logged in. Use save_p4_password tool or 'p4 login' after setup."
 fi
 
-# ── Step 5: Make scripts executable ──────────────────────────────────────────
-step "5/7" "Preparing scripts..."
-chmod +x "$SCRIPT_DIR/perforce-p4/p4-mcp-start.sh"
-ok "perforce-p4/p4-mcp-start.sh"
-ok "p4-workflow/server.py"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 8: Generate ~/.cursor/mcp.json
+# ═══════════════════════════════════════════════════════════════════════════════
+step "8/9" "Generating Cursor MCP config..."
 
-# ── Step 6: Generate ~/.cursor/mcp.json ──────────────────────────────────────
-step "6/7" "Generating Cursor MCP config..."
+chmod +x "$SCRIPT_DIR/perforce-p4/p4-mcp-start.sh"
+
 MCP_JSON="$HOME/.cursor/mcp.json"
 mkdir -p "$HOME/.cursor"
 
@@ -237,8 +323,10 @@ cat > "$MCP_JSON" << MCPEOF
 MCPEOF
 ok "Created: $MCP_JSON"
 
-# ── Step 7: Install Cursor rules for P4 workflow ────────────────────────────
-step "7/7" "Installing Cursor rules..."
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 9: Install Cursor rules
+# ═══════════════════════════════════════════════════════════════════════════════
+step "9/9" "Installing Cursor rules..."
 RULES_DIR="$HOME/.cursor/rules"
 mkdir -p "$RULES_DIR"
 
@@ -249,23 +337,22 @@ else
     warn "No rules file found at $SCRIPT_DIR/rules/p4-workflow.mdc — skipping."
 fi
 
-# ── Done ─────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Done
+# ═══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}${BOLD}  Setup Complete!${NC}"
 echo -e "${BOLD}════════════════════════════════════════════════${NC}"
 echo ""
+echo "What was installed:"
+echo "  p4 CLI:          $P4_BIN"
+[[ -n "${P4_MCP_BIN:-}" ]] && echo "  p4-mcp-server:   $P4_MCP_BIN"
+echo "  Python deps:     fastmcp, httpx"
+echo "  MCP config:      $MCP_JSON"
+echo "  Cursor rules:    $RULES_DIR/p4-workflow.mdc"
+echo ""
 echo "Next steps:"
 echo "  1. Restart your IDE (Cmd+Q, then reopen)"
 echo "  2. Test: ask your AI 'List my pending changelists'"
-echo ""
-echo "Scripts (run from this repo — no copies):"
-echo "  $SCRIPT_DIR/perforce-p4/p4-mcp-start.sh"
-echo "  $SCRIPT_DIR/p4-workflow/server.py"
-echo ""
-echo "Config:"
-echo "  $MCP_JSON"
-if [[ -f "$RULES_DIR/p4-workflow.mdc" ]]; then
-    echo "  $RULES_DIR/p4-workflow.mdc"
-fi
 echo ""

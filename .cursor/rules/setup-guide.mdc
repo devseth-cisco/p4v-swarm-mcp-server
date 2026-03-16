@@ -1,0 +1,39 @@
+---
+description: Setup instructions for this Perforce MCP server repo
+globs: **/*
+alwaysApply: true
+---
+
+# Perforce MCP Server Setup
+
+This repository provides MCP servers for Perforce + Swarm integration with Cursor IDE.
+
+## When user asks to "set up" or "install" this project:
+
+Run the setup script:
+```bash
+chmod +x setup.sh && ./setup.sh
+```
+
+The setup script handles EVERYTHING from a bare macOS machine:
+1. Installs Homebrew (if missing)
+2. Installs p4 CLI (if missing)
+3. Installs Python 3 (if missing)
+4. Installs Node.js (if missing, needed for sequential-thinking MCP)
+5. Downloads p4-mcp-server binary (guides user if manual download needed)
+6. Installs Python dependencies (fastmcp, httpx)
+7. Tests Perforce connectivity
+8. Authenticates + saves password to macOS Keychain
+9. Generates ~/.cursor/mcp.json with correct paths
+10. Installs Cursor AI workflow rules globally
+
+After setup completes, the user must restart Cursor (Cmd+Q, reopen).
+
+## Repository structure:
+
+- `setup.sh` — One-click installer (run this)
+- `perforce-p4/p4-mcp-start.sh` — Wrapper for official Perforce MCP server
+- `p4-workflow/server.py` — Custom Perforce + Swarm workflow MCP server
+- `p4-workflow/requirements.txt` — Python dependencies
+- `rules/p4-workflow.mdc` — Cursor AI rules for workflow guidance
+- `mcp.json.template` — Manual config reference
