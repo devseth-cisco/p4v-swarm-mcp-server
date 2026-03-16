@@ -1,0 +1,63 @@
+---
+description: Perforce + Swarm workflow rules for seamless code review operations
+globs: **/*
+alwaysApply: true
+---
+
+# Perforce + Swarm Workflow
+
+You have two MCP servers for Perforce operations. Use them correctly:
+
+## Server Selection
+
+- **perforce-p4** (official): Use for querying files, changelists, workspaces, server info, and basic CRUD.
+- **p4-workflow** (custom): Use for the full workflow — creating CLs, checking out files, shelving, raising reviews, fetching diffs, and auth.
+
+When both servers could handle a task, prefer **p4-workflow** for anything involving:
+- Creating changelists (it applies the correct Cisco IMS template)
+- Shelving / raising reviews (one-call operations)
+- Fetching review diffs (combines Swarm API + p4 describe)
+- Auth issues (has Keychain auto-login)
+
+Use **perforce-p4** for:
+- Querying file content, history, annotations
+- Listing changelists with filters
+- Workspace management
+- Server info / connection status
+
+## Workflow: Bug Fix → Review
+
+1. **Create CL**: `create_changelist(bug_id, workspace, description, root_cause, solution)`
+   - Workspace short name only (e.g. `7_4_1_MAIN`), prefix auto-added
+   - Template is auto-filled; provide only the required fields
+
+2. **Checkout files**: `checkout_file(file_path, changelist_id)`
+   - Accepts local paths OR depot paths — auto-converts
+   - Workspace auto-detected from CL
+
+3. **Edit code**: Make changes in the IDE as normal
+
+4. **Raise review**: `raise_review(changelist_id, reviewers=[...], required_reviewers=[...])`
+   - Shelves + creates Swarm review in ONE call
+   - Description auto-read from CL
+
+5. **Update review**: `update_review(changelist_id)`
+   - After more edits, just re-shelve — Swarm auto-versions
+
+6. **Fetch any review**: `get_review_diff(review_id)` or `get_review_info(review_id)`
+   - Works for ANY review (yours or colleagues')
+
+## Auth Rules
+
+- Auth is automatic via macOS Keychain. If a tool fails with "ticket expired":
+  1. First try: call `p4_login` tool — it auto-renews from Keychain
+  2. If that fails: call `save_p4_password` tool with the user's password
+  3. Never ask the user to run terminal commands unless the tools fail
+
+## Important Conventions
+
+- Workspace naming: `{username}_{branch}` (e.g. `devseth_7_4_1_MAIN`)
+- Only provide the branch part to tools; the username prefix is auto-added
+- CL descriptions follow the Cisco IMS template — do not deviate from it
+- When creating CLs, always ask for: bug_id, workspace, change_description, root_cause, solution
+- For update_description: use this to update CL descriptions without the 2000-char limit of the official server

@@ -2,47 +2,316 @@
 """
 p4-workflow -- Single source of truth for all Perforce + Swarm workflow operations.
 
-ONE-CLICK TOOLS:
-  create_changelist  -- create a CL with the exact Cisco template against a bug ID
-  update_review      -- save code changes -> Swarm auto-versions (1 call, workspace auto-detected)
-  raise_review       -- shelve + create Swarm review (1 call, description auto-read from CL)
-  add_review_comment -- add a comment to a review
-  checkout_file      -- open a file for edit in a changelist (p4 edit)
+All config is read from environment variables (set by mcp.json):
+  P4_BIN      -- path to p4 CLI          (default: p4 on PATH or ~/bin/p4)
+  P4PORT      -- Perforce server          (required)
+  P4USER      -- Perforce username        (required)
+  SWARM_URL   -- Swarm base URL           (default: https://sp4-fp-swarm.cisco.com)
 
-AUTH TOOLS (zero manual login):
-  p4_login           -- check ticket status; auto-refreshes from Keychain if stored
-  save_p4_password   -- one-time setup: store your P4 password in macOS Keychain
-
-AUTO-LOGIN:
-  Every p4 command auto-detects an expired ticket and silently re-authenticates
-  using the password stored in Keychain. Run save_p4_password once to enable this.
-
-Placeholders replaced by setup.sh:
-  __P4_BIN__    -> path to p4 CLI
-  __P4PORT__    -> Perforce server
-  __P4USER__    -> Perforce username
-  __SWARM_URL__ -> Swarm base URL
+Auth architecture:
+  1. Startup: validate ticket or auto-login from Keychain; warm Swarm ticket cache
+  2. Runtime: every _p4() call auto-retries on auth failure via Keychain
+  3. Swarm: ticket cached 20h; auto-refreshes on 401; extracted from `p4 login -p`
+  4. Both servers share Keychain service "p4-workflow" / account = P4USER
 """
-import sys
+import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
-import httpx
 import warnings
+
+import httpx
 
 sys.path.insert(0, os.path.dirname(__file__))
 from fastmcp import FastMCP
 
-# ── Config ──────────────────────────────────────────────────────────────────
-P4_BIN    = "__P4_BIN__"
-P4_PORT   = "__P4PORT__"
-P4_USER   = "__P4USER__"
+log = logging.getLogger("p4-workflow")
 
-SWARM_URL = "__SWARM_URL__"
+# ── Config (from environment — set by mcp.json env block) ───────────────────
+P4_BIN  = os.environ.get("P4_BIN") or shutil.which("p4") or os.path.expanduser("~/bin/p4")
+P4_PORT = os.environ["P4PORT"]
+P4_USER = os.environ["P4USER"]
+
+SWARM_URL = os.environ.get("SWARM_URL", "https://sp4-fp-swarm.cisco.com")
 SWARM_API = f"{SWARM_URL}/api/v9"
 
 _KEYCHAIN_SERVICE = "p4-workflow"
+
+# ── Auth layer ──────────────────────────────────────────────────────────────
+# Single auth subsystem shared by p4 commands and Swarm API calls.
+# Keychain password is read ONCE per server lifetime and cached in-process.
+# `save_p4_password` invalidates the cache so a fresh read happens next time.
+
+_kc_cache: dict = {"password": None, "checked": False}
+
+_TICKET_ERROR_SIGNALS = (
+    "ticket has expired",
+    "your session has expired",
+    "password invalid",
+    "p4passwd",
+    "password (p4passwd)",
+    "login required",
+)
+
+
+def _keychain_password(*, force_refresh: bool = False) -> str | None:
+    """Read P4 password from macOS Keychain. Cached after first read."""
+    if _kc_cache["checked"] and not force_refresh:
+        return _kc_cache["password"]
+    r = subprocess.run(
+        ["security", "find-generic-password", "-a", P4_USER, "-s", _KEYCHAIN_SERVICE, "-w"],
+        capture_output=True, text=True,
+    )
+    pw = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    _kc_cache["password"] = pw
+    _kc_cache["checked"] = True
+    return pw
+
+
+def _invalidate_kc_cache() -> None:
+    _kc_cache["password"] = None
+    _kc_cache["checked"] = False
+
+
+def _p4_env(client: str | None = None) -> dict:
+    """Build a clean env dict for p4 subprocesses."""
+    env = os.environ.copy()
+    env["P4PORT"] = P4_PORT
+    env["P4USER"] = P4_USER
+    if client:
+        env["P4CLIENT"] = client
+    return env
+
+
+def _ticket_valid() -> bool:
+    r = subprocess.run(
+        [P4_BIN, "login", "-s"],
+        capture_output=True, text=True, env=_p4_env(),
+    )
+    return r.returncode == 0
+
+
+def _ticket_status() -> str:
+    r = subprocess.run(
+        [P4_BIN, "login", "-s"],
+        capture_output=True, text=True, env=_p4_env(),
+    )
+    return r.stdout.strip() if r.returncode == 0 else (r.stderr or r.stdout).strip()
+
+
+def _do_login(password: str) -> bool:
+    r = subprocess.run(
+        [P4_BIN, "login"],
+        input=password, capture_output=True, text=True, env=_p4_env(),
+    )
+    return r.returncode == 0
+
+
+def _auto_login() -> bool:
+    """Try Keychain-stored password. Returns True on success."""
+    pwd = _keychain_password()
+    if not pwd:
+        return False
+    return _do_login(pwd)
+
+
+def _is_auth_error(msg: str) -> bool:
+    lower = msg.lower()
+    return any(s in lower for s in _TICKET_ERROR_SIGNALS)
+
+
+def _ensure_auth() -> None:
+    """Pre-flight: guarantee a valid ticket before first tool call.
+
+    Called at server startup and can be called before any critical operation.
+    Never raises — logs warnings instead so the server still starts.
+    """
+    if _ticket_valid():
+        log.info("Auth OK: %s", _ticket_status())
+        return
+    log.warning("Ticket expired at startup, attempting auto-login from Keychain...")
+    if _auto_login():
+        log.info("Auto-login succeeded: %s", _ticket_status())
+        return
+    if _keychain_password() is None:
+        log.warning(
+            "No Keychain entry found. Run save_p4_password tool or `p4 login` in a terminal."
+        )
+    else:
+        log.warning(
+            "Keychain password exists but login failed (wrong password?). "
+            "Run save_p4_password tool to update."
+        )
+
+
+# ── P4 command runner ────────────────────────────────────────────────────────
+def _p4(*args: str, client: str | None = None) -> str:
+    """Run a p4 command. Auto-retries once on auth failure via Keychain."""
+    env = _p4_env(client)
+    r = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
+
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+
+        if _is_auth_error(msg):
+            if _auto_login():
+                r2 = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
+                if r2.returncode == 0:
+                    return r2.stdout.strip()
+                msg = (r2.stderr or r2.stdout).strip()
+
+            has_kc = _keychain_password() is not None
+            if has_kc:
+                raise RuntimeError(
+                    "Perforce ticket expired and auto-login failed (wrong password stored?).\n"
+                    "Fix: run the save_p4_password tool to update your stored password,\n"
+                    "     or run `p4 login` in a terminal."
+                )
+            raise RuntimeError(
+                "Perforce ticket expired.\n"
+                "Quick fix: run the p4_login tool — it will guide you.\n"
+                "Permanent fix: run the save_p4_password tool once to enable auto-login."
+            )
+
+        if "Connect to server failed" in msg or "nodename nor servname" in msg:
+            raise RuntimeError(
+                f"Cannot reach Perforce server ({P4_PORT}).\n"
+                "Check your VPN connection and retry."
+            )
+
+        raise RuntimeError(msg)
+
+    return r.stdout.strip()
+
+
+# ── P4 helpers ───────────────────────────────────────────────────────────────
+def _opened_files(changelist_id: int, client: str) -> list[str]:
+    out = _p4("opened", "-c", str(changelist_id), client=client)
+    return [m.group(1) for line in out.splitlines() if (m := re.match(r"^(//[^#]+)#", line))]
+
+
+def _shelve(changelist_id: int, client: str) -> str:
+    files = _opened_files(changelist_id, client)
+    if not files:
+        raise RuntimeError(f"No open files found in changelist {changelist_id}")
+    return _p4("shelve", "-f", "-c", str(changelist_id), *files, client=client)
+
+
+def _client_for_cl(changelist_id: int) -> str:
+    out = _p4("change", "-o", str(changelist_id))
+    m = re.search(r"^Client:\t(\S+)", out, re.MULTILINE)
+    if not m:
+        raise RuntimeError(f"Could not detect client for changelist {changelist_id}.\nOutput: {out[:200]}")
+    return m.group(1)
+
+
+def _desc_for_cl(changelist_id: int) -> str:
+    out = _p4("change", "-o", str(changelist_id))
+    m = re.search(r"^Description:\n(.*?)(?=^\S|\Z)", out, re.MULTILINE | re.DOTALL)
+    if not m:
+        return ""
+    return "\n".join(line.lstrip("\t") for line in m.group(1).split("\n")).strip()
+
+
+def _resolve_client(workspace: str | None) -> str:
+    if not workspace:
+        raise RuntimeError("workspace is required for create_changelist")
+    if workspace.startswith(P4_USER + "_"):
+        return workspace
+    return f"{P4_USER}_{workspace}"
+
+
+# ── Swarm layer ─────────────────────────────────────────────────────────────
+# Persistent HTTP client reuses TCP connections across all Swarm calls.
+# Swarm authenticates with (P4USER, p4_ticket) — ticket from `p4 login -p`.
+# The ticket is cached for 20h and auto-refreshes on 401 from Swarm.
+
+warnings.filterwarnings("ignore", message=".*Unverified HTTPS.*")
+_http = httpx.Client(verify=False, timeout=30)
+
+_SWARM_TICKET_TTL = 20 * 3600  # 20h (p4 tickets expire in 24h)
+_swarm_ticket_cache: dict = {"value": None, "expires_at": 0.0}
+
+
+def _extract_ticket(raw: str) -> str:
+    """Extract the hex ticket hash from `p4 login -p` output.
+
+    Handles both clean output (just the hash) and noisy output
+    (messages + hash on last non-empty line).
+    """
+    for line in reversed(raw.strip().splitlines()):
+        stripped = line.strip()
+        if re.fullmatch(r"[0-9A-Fa-f]{32,}", stripped):
+            return stripped
+    return raw.strip().splitlines()[-1].strip() if raw.strip() else raw.strip()
+
+
+def _swarm_ticket(force_refresh: bool = False) -> str:
+    """Return a cached Swarm ticket; refresh only when expired or forced."""
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _swarm_ticket_cache["value"]
+        and now < _swarm_ticket_cache["expires_at"]
+    ):
+        return _swarm_ticket_cache["value"]
+    raw = _p4("login", "-p")
+    ticket = _extract_ticket(raw)
+    _swarm_ticket_cache["value"] = ticket
+    _swarm_ticket_cache["expires_at"] = now + _SWARM_TICKET_TTL
+    return ticket
+
+
+def _swarm(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    """Make a Swarm API call. Caches the ticket and retries once on 401."""
+    url = f"{SWARM_API}/{path}"
+    for attempt in range(2):
+        auth = (P4_USER, _swarm_ticket(force_refresh=(attempt > 0)))
+        if method == "get":
+            resp = _http.get(url, auth=auth)
+        elif method == "post":
+            resp = _http.post(url, auth=auth, json=payload or {})
+        else:
+            resp = _http.patch(url, auth=auth, json=payload or {})
+
+        if resp.status_code == 401 and attempt == 0:
+            _swarm_ticket_cache["value"] = None
+            continue
+        return resp.status_code, resp.json() if resp.content else {}
+
+    raise RuntimeError(
+        "Swarm authentication failed after ticket refresh.\n"
+        "Run p4_login to re-authenticate."
+    )
+
+
+# ── Startup auth ────────────────────────────────────────────────────────────
+_ensure_auth()
+
+# ── MCP server ──────────────────────────────────────────────────────────────
+mcp = FastMCP(
+    "p4-workflow",
+    instructions="""
+Single source of truth for Perforce + Swarm workflow -- one tool per task:
+
+  1. create_changelist  -> new CL with full Cisco template against a bug ID
+  2. checkout_file      -> open file(s) for edit in a CL (p4 edit)
+  3. update_description -> update CL description (no char limit)
+  4. update_review      -> after saving code, push new version to Swarm (1 call)
+  5. raise_review       -> first-time: shelve + create Swarm review (1 call)
+  6. add_review_comment -> comment on a review
+  7. get_review_diff    -> fetch full diff + metadata for any Swarm review
+  8. get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
+  9. p4_login           -> check ticket status; auto-refreshes from Keychain if stored
+ 10. save_p4_password   -> one-time: store P4 password in Keychain for auto-login
+
+Workspace (P4CLIENT) is always auto-detected from the changelist.
+Tickets auto-refresh from Keychain — run save_p4_password once to enable.
+""",
+)
 
 # Exact Cisco IMS changelist template
 _CL_TEMPLATE = """\
@@ -88,233 +357,6 @@ Review Link:
 Documentation:
 {documentation}"""
 
-# ── Keychain / auto-login helpers ────────────────────────────────────────────
-def _keychain_password() -> str | None:
-    """Read P4 password from macOS Keychain. Returns None if not stored."""
-    r = subprocess.run(
-        ["security", "find-generic-password", "-a", P4_USER, "-s", _KEYCHAIN_SERVICE, "-w"],
-        capture_output=True, text=True,
-    )
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
-
-
-def _ticket_valid() -> bool:
-    """Return True if the current P4 ticket is valid (non-expired)."""
-    r = subprocess.run(
-        [P4_BIN, "login", "-s"],
-        capture_output=True, text=True,
-        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER},
-    )
-    return r.returncode == 0
-
-
-def _ticket_status() -> str:
-    """Return human-readable ticket status string."""
-    r = subprocess.run(
-        [P4_BIN, "login", "-s"],
-        capture_output=True, text=True,
-        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER},
-    )
-    return r.stdout.strip() if r.returncode == 0 else (r.stderr or r.stdout).strip()
-
-
-def _do_login(password: str) -> bool:
-    """Log in with the given password. Returns True on success."""
-    r = subprocess.run(
-        [P4_BIN, "login"],
-        input=password, capture_output=True, text=True,
-        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER},
-    )
-    return r.returncode == 0
-
-
-def _auto_login() -> bool:
-    """Try to auto-login using the Keychain-stored password. Returns True on success."""
-    pwd = _keychain_password()
-    if not pwd:
-        return False
-    return _do_login(pwd)
-
-
-_TICKET_ERROR_SIGNALS = (
-    "ticket has expired",
-    "Your session has expired",
-    "Password invalid",
-    "P4PASSWD",
-    "password (P4PASSWD)",
-    "login required",
-)
-
-
-def _is_auth_error(msg: str) -> bool:
-    return any(s.lower() in msg.lower() for s in _TICKET_ERROR_SIGNALS)
-
-
-# ── P4 helpers ───────────────────────────────────────────────────────────────
-def _p4(*args: str, client: str | None = None) -> str:
-    env = os.environ.copy()
-    env["P4PORT"] = P4_PORT
-    env["P4USER"] = P4_USER
-    if client:
-        env["P4CLIENT"] = client
-
-    r = subprocess.run([P4_BIN] + list(args), capture_output=True, text=True, env=env)
-
-    if r.returncode != 0:
-        msg = (r.stderr or r.stdout).strip()
-
-        # Auto-retry once on expired ticket using Keychain password
-        if _is_auth_error(msg):
-            if _auto_login():
-                r2 = subprocess.run([P4_BIN] + list(args), capture_output=True, text=True, env=env)
-                if r2.returncode == 0:
-                    return r2.stdout.strip()
-                msg = (r2.stderr or r2.stdout).strip()
-
-            # Auto-login not configured or failed
-            pwd_stored = _keychain_password() is not None
-            if pwd_stored:
-                raise RuntimeError(
-                    "Perforce ticket expired and auto-login failed (wrong password stored?).\n"
-                    "Fix: run the save_p4_password tool to update your stored password,\n"
-                    "     or run `p4 login` in a terminal."
-                )
-            raise RuntimeError(
-                "Perforce ticket expired.\n"
-                "Quick fix: run the p4_login tool — it will guide you.\n"
-                "Permanent fix: run the save_p4_password tool once to enable auto-login."
-            )
-
-        if "Connect to server failed" in msg or "nodename nor servname" in msg:
-            raise RuntimeError(
-                f"Cannot reach Perforce server ({P4_PORT}).\n"
-                "Check your VPN connection and retry."
-            )
-
-        raise RuntimeError(msg)
-
-    return r.stdout.strip()
-
-
-def _opened_files(changelist_id: int, client: str) -> list[str]:
-    """Return list of depot paths open in a changelist."""
-    out = _p4("opened", "-c", str(changelist_id), client=client)
-    paths = []
-    for line in out.splitlines():
-        m = re.match(r"^(//[^#]+)#", line)
-        if m:
-            paths.append(m.group(1))
-    return paths
-
-
-def _shelve(changelist_id: int, client: str) -> str:
-    """Force-shelve all open files in a changelist."""
-    files = _opened_files(changelist_id, client)
-    if not files:
-        raise RuntimeError(f"No open files found in changelist {changelist_id}")
-    return _p4("shelve", "-f", "-c", str(changelist_id), *files, client=client)
-
-
-def _client_for_cl(changelist_id: int) -> str:
-    """Auto-detect P4CLIENT from a changelist ID."""
-    out = _p4("change", "-o", str(changelist_id))
-    m = re.search(r"^Client:\t(\S+)", out, re.MULTILINE)
-    if not m:
-        raise RuntimeError(
-            f"Could not detect client for changelist {changelist_id}.\n"
-            f"Output: {out[:200]}"
-        )
-    return m.group(1)
-
-
-def _desc_for_cl(changelist_id: int) -> str:
-    """Read the current description of a changelist."""
-    out = _p4("change", "-o", str(changelist_id))
-    m = re.search(r"^Description:\n(.*?)(?=^\S|\Z)", out, re.MULTILINE | re.DOTALL)
-    if not m:
-        return ""
-    lines = m.group(1).split("\n")
-    return "\n".join(line.lstrip("\t") for line in lines).strip()
-
-
-def _resolve_client(workspace: str | None) -> str:
-    """Resolve workspace name -> P4CLIENT. Prepends username if not already present."""
-    if not workspace:
-        raise RuntimeError("workspace is required for create_changelist")
-    if workspace.startswith(P4_USER + "_"):
-        return workspace
-    return f"{P4_USER}_{workspace}"
-
-
-# ── Swarm helpers ────────────────────────────────────────────────────────────
-# Persistent HTTP client — reuses TCP connections across all Swarm calls.
-_http = httpx.Client(verify=False, timeout=30)
-
-# Ticket cache — p4 login -p is a subprocess; call it once per session, not per request.
-_TICKET_CACHE_TTL = 20 * 3600  # 20 hours (p4 tickets expire in 24h)
-_swarm_ticket_cache: dict = {"value": None, "expires_at": 0.0}
-
-
-def _swarm_ticket(force_refresh: bool = False) -> str:
-    """Return a cached Swarm ticket; refresh only when expired or forced."""
-    now = time.monotonic()
-    if (
-        not force_refresh
-        and _swarm_ticket_cache["value"]
-        and now < _swarm_ticket_cache["expires_at"]
-    ):
-        return _swarm_ticket_cache["value"]
-    ticket = _p4("login", "-p")
-    _swarm_ticket_cache["value"] = ticket
-    _swarm_ticket_cache["expires_at"] = now + _TICKET_CACHE_TTL
-    return ticket
-
-
-def _swarm(method: str, path: str, payload: dict) -> tuple[int, dict]:
-    """Make a Swarm API call. Caches the ticket and retries once on 401."""
-    url = f"{SWARM_API}/{path}"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for attempt in range(2):
-            auth = (P4_USER, _swarm_ticket(force_refresh=(attempt > 0)))
-            if method == "get":
-                resp = _http.get(url, auth=auth)
-            elif method == "post":
-                resp = _http.post(url, auth=auth, json=payload)
-            else:
-                resp = _http.patch(url, auth=auth, json=payload)
-            # On 401, invalidate the cache and retry once with a fresh ticket
-            if resp.status_code == 401 and attempt == 0:
-                _swarm_ticket_cache["value"] = None
-                continue
-            return resp.status_code, resp.json() if resp.content else {}
-    raise RuntimeError(
-        "Swarm authentication failed after ticket refresh.\n"
-        "Run p4_login to re-authenticate."
-    )
-
-
-# ── MCP server ───────────────────────────────────────────────────────────────
-mcp = FastMCP(
-    "p4-workflow",
-    instructions="""
-Single source of truth for Perforce + Swarm workflow -- one tool per task:
-
-  1. create_changelist  -> new CL with full Cisco template against a bug ID
-  2. checkout_file      -> open file(s) for edit in a CL (p4 edit)
-  3. update_review      -> after saving code, push new version to Swarm (1 call)
-  4. raise_review       -> first-time: shelve + create Swarm review (1 call)
-  5. add_review_comment -> comment on a review
-  6. get_review_diff    -> fetch full diff + metadata for any Swarm review
-  7. get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
-  8. p4_login           -> check ticket status; auto-refreshes from Keychain if stored
-  9. save_p4_password   -> one-time: store P4 password in Keychain for auto-login
-
-Workspace (P4CLIENT) is always auto-detected.
-Tickets auto-refresh from Keychain — run save_p4_password once to enable.
-""",
-)
-
 
 # ── Auth tools ───────────────────────────────────────────────────────────────
 @mcp.tool()
@@ -327,11 +369,9 @@ def p4_login() -> str:
     if _ticket_valid():
         return f"Logged in. {_ticket_status()}"
 
-    # Ticket expired — try auto-login from Keychain
     if _auto_login():
         return f"Ticket expired — auto-renewed from Keychain. {_ticket_status()}"
 
-    # No Keychain entry
     return (
         "Perforce ticket expired and no password stored in Keychain.\n\n"
         "Option 1 (recommended — enables auto-login forever):\n"
@@ -354,7 +394,6 @@ def save_p4_password(password: str) -> str:
     Args:
         password: Your Perforce password (P4PASSWD)
     """
-    # Remove any existing entry first (ignore errors)
     subprocess.run(
         ["security", "delete-generic-password", "-a", P4_USER, "-s", _KEYCHAIN_SERVICE],
         capture_output=True,
@@ -367,7 +406,8 @@ def save_p4_password(password: str) -> str:
     if r.returncode != 0:
         raise RuntimeError(f"Failed to save to Keychain: {r.stderr.strip()}")
 
-    # Verify it works right now
+    _invalidate_kc_cache()
+
     if _do_login(password):
         return (
             f"Password saved to Keychain (service: {_KEYCHAIN_SERVICE}, account: {P4_USER}).\n"
@@ -376,7 +416,7 @@ def save_p4_password(password: str) -> str:
         )
 
     return (
-        f"Password saved to Keychain, but login failed — double-check your password.\n"
+        "Password saved to Keychain, but login failed — double-check your password.\n"
         "Run save_p4_password again with the correct password."
     )
 
@@ -430,13 +470,9 @@ def create_changelist(
     for line in description.split("\n"):
         spec += f"\t{line}\n"
 
-    env = os.environ.copy()
-    env["P4PORT"] = P4_PORT
-    env["P4USER"] = P4_USER
-    env["P4CLIENT"] = client
     r = subprocess.run(
         [P4_BIN, "change", "-i"],
-        input=spec, capture_output=True, text=True, env=env
+        input=spec, capture_output=True, text=True, env=_p4_env(client),
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip())
@@ -501,8 +537,7 @@ def update_description(changelist_id: int, description: str) -> str:
     )
     r = subprocess.run(
         [P4_BIN, "change", "-i"],
-        input=new_spec, capture_output=True, text=True,
-        env={**os.environ, "P4PORT": P4_PORT, "P4USER": P4_USER, "P4CLIENT": client},
+        input=new_spec, capture_output=True, text=True, env=_p4_env(client),
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip())
@@ -585,14 +620,14 @@ def get_review_diff(review_id: int, max_lines: int = 600) -> str:
         review_id: Swarm review ID (e.g. 4960267)
         max_lines: Truncate diff output at this many lines (default 600)
     """
-    status, body = _swarm("get", f"reviews/{review_id}", {})
+    status, body = _swarm("get", f"reviews/{review_id}")
     if status != 200:
         raise RuntimeError(f"Swarm API returned {status} for review {review_id}: {body}")
 
-    review  = body["review"]
-    author  = review.get("author", "?")
-    state   = review.get("state", "?")
-    desc    = (review.get("description") or "").strip().splitlines()[0] if review.get("description") else ""
+    review = body["review"]
+    author = review.get("author", "?")
+    state = review.get("state", "?")
+    desc = (review.get("description") or "").strip().splitlines()[0] if review.get("description") else ""
     changes = review.get("changes") or review.get("versions", [{}])[-1].get("change", [])
     if isinstance(changes, int):
         changes = [changes]
@@ -629,14 +664,14 @@ def get_review_info(review_id: int) -> str:
     Args:
         review_id: Swarm review ID (e.g. 4960267)
     """
-    status, body = _swarm("get", f"reviews/{review_id}", {})
+    status, body = _swarm("get", f"reviews/{review_id}")
     if status != 200:
         raise RuntimeError(f"Swarm API returned {status}: {body}")
 
-    review  = body["review"]
-    author  = review.get("author", "?")
-    state   = review.get("state", "?")
-    desc    = (review.get("description") or "").strip()
+    review = body["review"]
+    author = review.get("author", "?")
+    state = review.get("state", "?")
+    desc = (review.get("description") or "").strip()
     changes = review.get("changes") or []
     if isinstance(changes, int):
         changes = [changes]

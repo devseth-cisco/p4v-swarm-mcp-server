@@ -5,23 +5,32 @@
       "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
     },
     "perforce-p4": {
-      "command": "REPLACE_WITH_PATH_TO/bin/p4-mcp-start.sh",
+      "command": "REPO_DIR/perforce-p4/p4-mcp-start.sh",
       "args": [
         "--toolsets", "files", "changelists", "shelves", "workspaces", "jobs", "reviews"
       ],
       "env": {
-        "P4PORT": "ssl:REPLACE_WITH_YOUR_P4_SERVER:1666",
-        "P4USER": "REPLACE_WITH_YOUR_USERNAME",
-        "PATH": "REPLACE_WITH_YOUR_HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-      }
+        "P4PORT": "ssl:YOUR_P4_SERVER:1666",
+        "P4USER": "YOUR_USERNAME",
+        "P4CLIENT_DEFAULT": "YOUR_USERNAME_YOUR_WORKSPACE",
+        "P4_BIN": "/path/to/p4",
+        "P4_MCP_SERVER": "/path/to/p4-mcp-server",
+        "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "alwaysAllow": []
     },
     "p4-workflow": {
       "command": "python3",
-      "args": ["REPLACE_WITH_PATH_TO/bin/p4-workflow/server.py"],
+      "args": ["REPO_DIR/p4-workflow/server.py"],
       "env": {
-        "PYTHONPATH": "REPLACE_WITH_PATH_TO/bin/p4-workflow",
-        "PATH": "REPLACE_WITH_YOUR_HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-      }
+        "P4PORT": "ssl:YOUR_P4_SERVER:1666",
+        "P4USER": "YOUR_USERNAME",
+        "P4_BIN": "/path/to/p4",
+        "SWARM_URL": "https://YOUR_SWARM_SERVER",
+        "PYTHONPATH": "REPO_DIR/p4-workflow",
+        "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "alwaysAllow": []
     }
   }
 }

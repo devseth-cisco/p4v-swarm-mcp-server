@@ -7,6 +7,27 @@ Two MCP (Model Context Protocol) servers that give your Agentic IDE full Perforc
 | **perforce-p4** | Official Perforce MCP server — query/modify files, changelists, shelves, workspaces, jobs, reviews |
 | **p4-workflow** | Custom one-click workflow — create CLs with Cisco template, checkout files, shelve, raise Swarm reviews, fetch diffs from any review, add comments |
 
+## Architecture
+
+Scripts run directly from this repo — no copies, no placeholders, no deployment step.
+
+All config is passed as **environment variables** via `mcp.json`. Edit once in mcp.json, restart your IDE, done.
+
+```
+~/.cursor/mcp.json
+    │
+    ├── perforce-p4 ──► this-repo/perforce-p4/p4-mcp-start.sh
+    │                       ├── reads P4PORT, P4USER, P4_BIN, P4_MCP_SERVER from env
+    │                       ├── resolves P4CLIENT from `p4 set`
+    │                       ├── auto-login from Keychain if ticket expired
+    │                       └── exec p4-mcp-server
+    │
+    └── p4-workflow ──► this-repo/p4-workflow/server.py
+                            ├── reads P4PORT, P4USER, P4_BIN, SWARM_URL from env
+                            ├── auto-login from Keychain on every p4 command
+                            └── FastMCP server with 9 tools
+```
+
 ---
 
 ## Prerequisites
@@ -25,173 +46,98 @@ Two MCP (Model Context Protocol) servers that give your Agentic IDE full Perforc
 ## Quick Start (Automated)
 
 ```bash
-cd agentic-ide-p4-mcp-setup
+git clone <this-repo>
+cd p4v-swarm-mcp-server
 chmod +x setup.sh
 ./setup.sh
 ```
 
-Example session (using devseth's config as reference):
-```
-Perforce username (P4USER): devseth
-Perforce server (P4PORT) [ssl:sbg-perforce.esl.cisco.com:1666]: ssl:sbg-perforce.esl.cisco.com:1666
-Default workspace name (e.g. 7_4_1_MAIN): 7_4_1_MAIN
-Swarm URL [https://sp4-fp-swarm.cisco.com]: https://sp4-fp-swarm.cisco.com
-Install directory [/Users/devseth/bin]: /Users/devseth/bin
-
-Configuration:
-  P4USER          = devseth
-  P4PORT          = ssl:sbg-perforce.esl.cisco.com:1666
-  Default Client  = devseth_7_4_1_MAIN
-  Swarm URL       = https://sp4-fp-swarm.cisco.com
-  Install Dir     = /Users/devseth/bin
-
-Proceed? (y/n): y
-```
+The setup script will:
+1. Check for `p4` CLI and `p4-mcp-server`
+2. Install Python dependencies (`fastmcp`, `httpx`)
+3. Generate `~/.cursor/mcp.json` pointing to this repo's scripts
 
 Then restart your IDE.
 
 ---
 
-## Manual Setup (Step-by-Step)
+## Manual Setup
 
-### Step 1: Install p4 CLI
+### Step 1: Install prerequisites
 
 ```bash
-# macOS (Homebrew)
 brew install --cask perforce
-
-# Or download directly and place in ~/bin/
-mkdir -p ~/bin
-# Copy the downloaded p4 binary to ~/bin/p4
-chmod +x ~/bin/p4
+brew install python3
+pip3 install fastmcp httpx
 ```
 
-Verify it works:
-```bash
-~/bin/p4 -V
-```
+Download `p4-mcp-server` from Perforce and place it in `~/bin/p4-mcp-server*/p4-mcp-server`.
 
-### Step 2: Configure p4 CLI
+### Step 2: Configure mcp.json
 
-```bash
-# Set your Perforce server and user
-p4 set P4PORT=ssl:YOUR-P4-SERVER:1666
-p4 set P4USER=YOUR_USERNAME
-p4 set P4CLIENT=YOUR_WORKSPACE_NAME
-
-# Login (you'll be prompted for password)
-p4 login
-```
-
-### Step 3: Install p4-mcp-server (Official Perforce MCP Server)
-
-1. Download from Perforce website — look for "Helix MCP Server" for your platform
-2. Extract and place the binary:
-
-```bash
-mkdir -p ~/bin/p4-mcp-server
-# Copy/move the extracted p4-mcp-server binary into ~/bin/p4-mcp-server/
-chmod +x ~/bin/p4-mcp-server/p4-mcp-server
-```
-
-3. Copy the wrapper script:
-
-```bash
-cp perforce-p4/p4-mcp-start.sh ~/bin/p4-mcp-start.sh
-chmod +x ~/bin/p4-mcp-start.sh
-```
-
-4. Edit `~/bin/p4-mcp-start.sh` — update these values:
-
-```bash
-export P4PORT="${P4PORT:-ssl:YOUR-P4-SERVER:1666}"
-export P4USER="${P4USER:-YOUR_USERNAME}"
-# Update the fallback workspace name:
-export P4CLIENT="YOUR_DEFAULT_WORKSPACE"
-# Update the path to the p4-mcp-server binary:
-exec ~/bin/p4-mcp-server/p4-mcp-server "$@"
-```
-
-### Step 4: Install p4-workflow (Custom Workflow Server)
-
-1. Install Python dependencies:
-
-```bash
-cd p4-workflow
-pip3 install -r requirements.txt
-```
-
-2. Copy server.py to your preferred location:
-
-```bash
-mkdir -p ~/bin/p4-workflow
-cp server.py ~/bin/p4-workflow/server.py
-```
-
-3. Edit `~/bin/p4-workflow/server.py` — update the config block at the top:
-
-```python
-P4_BIN    = "/path/to/your/p4"          # e.g. ~/bin/p4 or /usr/local/bin/p4
-P4_PORT   = "ssl:YOUR-P4-SERVER:1666"
-P4_USER   = "YOUR_USERNAME"
-SWARM_URL = "https://YOUR-SWARM-SERVER"
-```
-
-### Step 5: Configure Agentic IDE MCP Settings
-
-1. Open or create `~/.cursor/mcp.json`
-2. Copy the contents of `mcp.json.template` from this repo
-3. Update all paths and credentials to match your setup
-
-The file should look like:
+Create or edit `~/.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "sequential-thinking": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
-    },
     "perforce-p4": {
-      "command": "/PATH/TO/YOUR/bin/p4-mcp-start.sh",
+      "command": "/path/to/this-repo/perforce-p4/p4-mcp-start.sh",
       "args": [
         "--toolsets", "files", "changelists", "shelves", "workspaces", "jobs", "reviews"
       ],
       "env": {
         "P4PORT": "ssl:YOUR-P4-SERVER:1666",
         "P4USER": "YOUR_USERNAME",
-        "PATH": "/YOUR/HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        "P4CLIENT_DEFAULT": "YOUR_USERNAME_YOUR_WORKSPACE",
+        "P4_BIN": "/path/to/p4",
+        "P4_MCP_SERVER": "/path/to/p4-mcp-server",
+        "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
       }
     },
     "p4-workflow": {
       "command": "python3",
-      "args": ["/PATH/TO/YOUR/bin/p4-workflow/server.py"],
+      "args": ["/path/to/this-repo/p4-workflow/server.py"],
       "env": {
-        "PYTHONPATH": "/PATH/TO/YOUR/bin/p4-workflow",
-        "PATH": "/YOUR/HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        "P4PORT": "ssl:YOUR-P4-SERVER:1666",
+        "P4USER": "YOUR_USERNAME",
+        "P4_BIN": "/path/to/p4",
+        "SWARM_URL": "https://YOUR-SWARM-SERVER",
+        "PYTHONPATH": "/path/to/this-repo/p4-workflow",
+        "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
       }
     }
   }
 }
 ```
 
-### Step 6: Restart your IDE
-
-Close and reopen your IDE. The MCP servers will start automatically.
-
-### Step 7: Verify
-
-In your IDE's AI chat, try:
+### Step 3: Restart your IDE and test
 
 ```
 List my pending changelists
 ```
 
-or
+---
 
-```
-Create a changelist for bug CSCxx12345 on workspace 7_4_1_MAIN
-```
+## Environment Variables
+
+### perforce-p4 (p4-mcp-start.sh)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `P4PORT` | Yes | Perforce server (e.g. `ssl:server:1666`) |
+| `P4USER` | Yes | Perforce username |
+| `P4CLIENT_DEFAULT` | No | Fallback workspace when `p4 set P4CLIENT` returns nothing |
+| `P4_BIN` | No | Path to `p4` CLI (auto-detected from PATH or `~/bin/p4`) |
+| `P4_MCP_SERVER` | No | Path to `p4-mcp-server` binary (auto-detected from `~/bin/p4-mcp-server*`) |
+
+### p4-workflow (server.py)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `P4PORT` | Yes | Perforce server |
+| `P4USER` | Yes | Perforce username |
+| `SWARM_URL` | No | Swarm base URL (default: `https://sp4-fp-swarm.cisco.com`) |
+| `P4_BIN` | No | Path to `p4` CLI (auto-detected) |
 
 ---
 
@@ -221,58 +167,14 @@ Create a changelist for bug CSCxx12345 on workspace 7_4_1_MAIN
 |------|-------------|
 | `create_changelist` | Create CL with full Cisco IMS template against a bug ID |
 | `checkout_file` | Open file(s) for edit in a CL (`p4 edit`) |
+| `update_description` | Update CL description with no char limit |
 | `update_review` | Re-shelve code changes — Swarm auto-versions |
 | `raise_review` | Shelve + create a new Swarm review (one call) |
-| `get_review_diff` | Fetch full diff + metadata for **any** Swarm review by ID |
+| `get_review_diff` | Fetch full diff + metadata for any Swarm review |
 | `get_review_info` | Fetch metadata + file list for any Swarm review (no diff body) |
 | `add_review_comment` | Add a comment to a Swarm review |
-
-#### Fetching Diffs from Any Review
-
-You can read any colleague's review without opening a browser:
-
-```
-# Full diff (code changes, max 600 lines by default)
-get_review_diff(4960267)
-
-# Just metadata + file list (fast, no diff body)
-get_review_info(4960267)
-
-# Increase line limit for large reviews
-get_review_diff(4960267, max_lines=1200)
-```
-
-Example output:
-```
-Review:      https://sp4-fp-swarm.cisco.com/reviews/4960267
-Author:      baveerap
-State:       archived
-Description: Fixes: baveerap CSCws05587
-Changelists: 4960264, 4960268, ...
-────────────────────────────────────────────────────────────
-=== CL 4960264 ===
-Change 4960264 by baveerap@baveerap_IMS_10_5_MAIN ...
-
---- //depot/.../fix_blob_type_affinity.py   (before)
-+++ //depot/.../fix_blob_type_affinity.py   (shelved)
-@@ -1,5 +1,12 @@
-+import sqlite3
- ...
-```
-
----
-
-## Supported Workspaces
-
-The p4-workflow server auto-detects the workspace from the changelist. Works with any workspace that follows the `{username}_{branch}` naming convention:
-
-- `7_4_1_MAIN`
-- `IMS_7_7_MAIN`
-- `ims_10_10_MAIN`
-- `IMS_10_5_MAIN`
-- `new_ims_7_g_main`
-- `7_2_MR`
-- _(any other workspace)_
+| `p4_login` | Check/refresh login status (auto-renews from Keychain) |
+| `save_p4_password` | Store P4 password in Keychain for auto-login |
 
 ---
 
@@ -287,28 +189,22 @@ The p4-workflow server auto-detects the workspace from the changelist. Works wit
 - Verify P4PORT: `p4 -p ssl:YOUR-SERVER:1666 info`
 
 **p4-workflow "module not found"?**
-- Ensure `pip3 install -r requirements.txt` completed successfully
-- Check PYTHONPATH in mcp.json points to the directory containing server.py
+- Run `pip3 install fastmcp httpx`
+- Check `PYTHONPATH` in mcp.json points to the directory containing `server.py`
 
-**"No open files found in changelist"?**
-- Use `checkout_file` tool first before `update_review`
-
-**`get_review_diff` returns "Swarm API returned 404"?**
-- Double-check the review ID exists at your Swarm URL
-- Ensure your P4 ticket is valid (`p4 login`) — the server uses it for Swarm auth
-
-**`get_review_diff` diff is truncated?**
-- Pass a higher `max_lines` value: `get_review_diff(4960267, max_lines=2000)`
+**"P4PORT must be set" error?**
+- Ensure `env` block in mcp.json includes `P4PORT` and `P4USER`
 
 ---
 
 ## File Structure
 
 ```
-agentic-ide-p4-mcp-setup/
+p4v-swarm-mcp-server/
   README.md              <- You are here
-  setup.sh               <- Automated installer
+  setup.sh               <- Automated installer (generates mcp.json)
   mcp.json.template      <- Template for ~/.cursor/mcp.json
+  .gitignore
   perforce-p4/
     p4-mcp-start.sh      <- Wrapper script for official MCP server
   p4-workflow/
