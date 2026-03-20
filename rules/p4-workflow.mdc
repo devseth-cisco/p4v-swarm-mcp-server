@@ -49,10 +49,11 @@ Use **perforce-p4** for:
 
 ## Auth Rules
 
-- Auth is automatic via macOS Keychain. If a tool fails with "ticket expired":
-  1. First try: call `p4_login` tool — it auto-renews from Keychain
-  2. If that fails: call `save_p4_password` tool with the user's password
-  3. Never ask the user to run terminal commands unless the tools fail
+- Auth is fully automatic — you never need to handle it manually:
+  - Every p4 command auto-retries with Keychain, then opens the browser for SSO if needed
+  - If a tool fails with an auth error, just retry — the server handles login silently
+  - `p4_login` exists but is rarely needed; `save_p4_password` is a one-time setup for fully silent auth
+  - Never ask the user to run terminal commands for auth — the server does it all
 
 ## Important Conventions
 

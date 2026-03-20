@@ -8,7 +8,8 @@ Single source of truth for Perforce + Swarm workflow -- one tool per task:
   6. add_review_comment -> comment on a review
   7. get_review_diff    -> fetch full diff + metadata for any Swarm review
   8. get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
-  9. p4_login           -> check ticket; if expired, returns SAML browser login URL
+  9. p4_login           -> check/refresh ticket (usually not needed — auth is automatic)
+ 10. save_p4_password   -> one-time: store P4 password in Keychain for silent auth
 
 Workspace (P4CLIENT) is always auto-detected from the changelist.
-Auth uses SAML/SSO — run p4_login to get a browser URL when the ticket expires.
+Auth is fully automatic — Keychain first, then browser SSO if needed. No manual steps.

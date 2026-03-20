@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Wrapper for p4-mcp-server that:
 #   1. Sets P4PORT / P4USER / P4CLIENT from environment (passed by mcp.json)
-#   2. Auto-refreshes expired tickets from macOS Keychain
+#   2. Auto-refreshes expired tickets: Keychain → SAML browser (zero-touch)
 #   3. Guards against P4CLIENT=none from stale .p4enviro
 #
 # All config comes from environment variables — no hardcoded placeholders.
@@ -24,11 +24,20 @@ fi
 
 export P4CLIENT="${ACTIVE_CLIENT:-$P4CLIENT_DEFAULT}"
 
-# ── Auto-login from Keychain if ticket is expired ────────────────────────────
+# ── Auto-login: Keychain first, then SAML with auto-browser-open ────────────
 if ! "$P4_BIN" login -s >/dev/null 2>&1; then
     KC_PASS=$(security find-generic-password -a "$P4USER" -s "p4-workflow" -w 2>/dev/null)
     if [[ -n "$KC_PASS" ]]; then
         echo "$KC_PASS" | "$P4_BIN" login >/dev/null 2>&1
+    fi
+
+    if ! "$P4_BIN" login -s >/dev/null 2>&1; then
+        "$P4_BIN" login 2>&1 | while IFS= read -r line; do
+            case "$line" in
+                *"Navigate to URL:"*)
+                    open "${line#*Navigate to URL: }" ;;
+            esac
+        done
     fi
 fi
 

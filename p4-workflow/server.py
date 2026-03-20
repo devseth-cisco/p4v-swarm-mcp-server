@@ -8,11 +8,12 @@ All config is read from environment variables (set by mcp.json):
   P4USER      -- Perforce username        (required)
   SWARM_URL   -- Swarm base URL           (default: https://sp4-fp-swarm.cisco.com)
 
-Auth architecture:
-  1. Startup: validate ticket; warn if expired (SAML requires browser-based login)
-  2. Runtime: every _p4() call raises with p4_login instructions on auth failure
+Auth architecture (zero-touch):
+  1. Startup: validate ticket → Keychain auto-login if expired
+  2. Runtime: every _p4() call auto-handles auth (Keychain → SAML browser → retry)
   3. Swarm: ticket cached 20h; auto-refreshes on 401; extracted from `p4 login -p`
-  4. Login: p4_login tool runs `p4 login`, extracts the SSO URL, returns it to user
+  4. User never sees auth errors — browser opens automatically when needed
+  5. save_p4_password: one-time Keychain setup for fully silent auth (no browser)
 """
 import logging
 import os
@@ -39,8 +40,8 @@ SWARM_URL = os.environ.get("SWARM_URL", "https://sp4-fp-swarm.cisco.com")
 SWARM_API = f"{SWARM_URL}/api/v9"
 
 # ── Auth layer ──────────────────────────────────────────────────────────────
-# Perforce uses SAML/SSO — no password-based auth. Login is browser-based:
-#   `p4 login` prints a URL, user visits it, p4 writes the ticket.
+# Auth cascade: Keychain password (instant) → SAML/SSO (auto-opens browser).
+# Once save_p4_password stores a password, all auth is fully silent.
 
 _TICKET_ERROR_SIGNALS = (
     "ticket has expired",
@@ -50,6 +51,56 @@ _TICKET_ERROR_SIGNALS = (
     "password (p4passwd)",
     "login required",
 )
+
+_KEYCHAIN_SERVICE = "p4-workflow"
+
+
+# ── Keychain helpers (macOS) ─────────────────────────────────────────────────
+def _keychain_read() -> str | None:
+    """Read P4 password from macOS Keychain. Returns None if not stored."""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-a", P4_USER,
+             "-s", _KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True,
+        )
+        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    except FileNotFoundError:
+        return None
+
+
+def _keychain_write(password: str) -> bool:
+    """Store P4 password in macOS Keychain. Overwrites any existing entry."""
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", P4_USER,
+         "-s", _KEYCHAIN_SERVICE],
+        capture_output=True,
+    )
+    r = subprocess.run(
+        ["security", "add-generic-password", "-a", P4_USER,
+         "-s", _KEYCHAIN_SERVICE, "-w", password],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def _login_with_password(password: str) -> bool:
+    """Pipe a password into `p4 login`. Returns True on success."""
+    r = subprocess.run(
+        [P4_BIN, "login"],
+        input=password + "\n",
+        capture_output=True, text=True, env=_p4_env(),
+    )
+    return r.returncode == 0
+
+
+def _try_keychain_login() -> bool:
+    """Attempt silent login using the password stored in macOS Keychain."""
+    pw = _keychain_read()
+    if pw and _login_with_password(pw):
+        log.info("Auto-logged in from Keychain")
+        return True
+    return False
 
 
 def _p4_env(client: str | None = None) -> dict:
@@ -82,28 +133,45 @@ def _ticket_status() -> str:
     return msg
 
 
-def _do_saml_login() -> str:
-    """Start `p4 login` SAML flow. Returns the SSO URL for the user to visit.
+def _do_saml_login() -> tuple[bool, str]:
+    """Run the full SAML/SSO login: extract URL, open browser, wait for ticket.
 
-    Launches `p4 login`, reads lines until the SSO URL appears, then returns
-    it immediately. The login process keeps running in the background and
-    writes the ticket once the user completes the browser auth.
+    1. Starts `p4 login` which prints a SAML URL
+    2. Auto-opens the URL in the default browser
+    3. Waits for the p4 process to finish (it exits after browser auth completes)
+    4. Verifies the ticket is valid
 
-    Raises RuntimeError if no URL is found (e.g. VPN down, wrong P4PORT).
+    Returns (success, human-readable message).
     """
     proc = subprocess.Popen(
         [P4_BIN, "login"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, env=_p4_env(),
     )
+
+    url = None
     for line in iter(proc.stdout.readline, ""):
         if "Navigate to URL:" in line:
-            return line.split("Navigate to URL:", 1)[-1].strip()
-    proc.kill()
-    raise RuntimeError(
-        "p4 login did not output a SAML URL.\n"
-        "Check that your VPN is connected and P4PORT is reachable."
-    )
+            url = line.split("Navigate to URL:", 1)[-1].strip()
+            subprocess.Popen(["open", url])
+            break
+
+    if not url:
+        proc.kill()
+        return False, (
+            "p4 login did not output a SAML URL. "
+            "Check that your VPN is connected and P4PORT is reachable."
+        )
+
+    try:
+        proc.wait(timeout=180)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return False, f"Browser login timed out (3 min). Complete manually: {url}"
+
+    if _ticket_valid():
+        return True, "Logged in via browser SSO."
+    return False, f"Browser auth completed but ticket not valid. Retry: {url}"
 
 
 def _is_auth_error(msg: str) -> bool:
@@ -112,20 +180,20 @@ def _is_auth_error(msg: str) -> bool:
 
 
 def _ensure_auth() -> None:
-    """Pre-flight: check ticket validity at server startup. Never raises."""
+    """Pre-flight: check ticket, auto-login from Keychain if expired. Never raises."""
     ok, status = _check_ticket()
     if ok:
         log.info("Auth OK: %s", status)
         return
-    log.warning(
-        "Perforce ticket expired at startup. "
-        "Call the p4_login tool to get a browser login URL."
-    )
+    if _try_keychain_login():
+        log.info("Auth OK (auto-refreshed from Keychain)")
+        return
+    log.warning("Perforce ticket expired at startup — will auto-login on first command.")
 
 
 # ── P4 command runner ────────────────────────────────────────────────────────
 def _p4(*args: str, client: str | None = None) -> str:
-    """Run a p4 command. Auto-retries once on auth failure via Keychain."""
+    """Run a p4 command. Handles all auth automatically — never prompts the user."""
     env = _p4_env(client)
     r = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
 
@@ -133,10 +201,18 @@ def _p4(*args: str, client: str | None = None) -> str:
         msg = (r.stderr or r.stdout).strip()
 
         if _is_auth_error(msg):
-            raise RuntimeError(
-                "Perforce ticket expired.\n"
-                "Run the p4_login tool — it will open a browser login URL."
-            )
+            if _try_keychain_login():
+                r = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
+                if r.returncode == 0:
+                    return r.stdout.strip()
+
+            ok, login_msg = _do_saml_login()
+            if ok:
+                r = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
+                if r.returncode == 0:
+                    return r.stdout.strip()
+
+            raise RuntimeError(f"Authentication failed after auto-login.\n{login_msg}")
 
         if "Connect to server failed" in msg or "nodename nor servname" in msg:
             raise RuntimeError(
@@ -245,8 +321,7 @@ def _swarm(method: str, path: str, payload: dict | None = None) -> tuple[int, di
         return resp.status_code, resp.json() if resp.content else {}
 
     raise RuntimeError(
-        "Swarm authentication failed after ticket refresh.\n"
-        "Run p4_login to re-authenticate."
+        "Swarm authentication failed after ticket refresh."
     )
 
 
@@ -267,10 +342,11 @@ Single source of truth for Perforce + Swarm workflow -- one tool per task:
   6. add_review_comment -> comment on a review
   7. get_review_diff    -> fetch full diff + metadata for any Swarm review
   8. get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
-  9. p4_login           -> check ticket; if expired, returns SAML browser login URL
+  9. p4_login           -> check/refresh ticket (usually not needed — auth is automatic)
+ 10. save_p4_password   -> one-time: store P4 password in Keychain for silent auth
 
 Workspace (P4CLIENT) is always auto-detected from the changelist.
-Auth uses SAML/SSO — run p4_login to get a browser URL when the ticket expires.
+Auth is fully automatic — Keychain first, then browser SSO if needed. No manual steps.
 """,
 )
 
@@ -322,22 +398,54 @@ Documentation:
 # ── Auth tools ───────────────────────────────────────────────────────────────
 @mcp.tool()
 def p4_login() -> str:
-    """Check Perforce login status. If expired, starts the SAML/SSO login flow.
+    """Check Perforce login status and auto-refresh the ticket if possible.
 
-    When the ticket is expired, this tool runs `p4 login`, extracts the
-    SSO URL, and returns it. Open the URL in your browser to authenticate.
-    The login process completes automatically once you finish browser auth.
+    Auth cascade (fully automatic):
+      1. Already logged in? → done.
+      2. Password in Keychain? → silent refresh → done.
+      3. SAML/SSO → opens browser automatically → waits for completion → done.
+
+    If a password is stored in Keychain (via save_p4_password), the ticket is
+    refreshed automatically. Otherwise opens the SSO URL in your default
+    browser — just complete the auth, everything else is handled.
     """
     if _ticket_valid():
-        return f"Logged in. {_ticket_status()}"
+        return f"Already logged in. {_ticket_status()}"
 
-    url = _do_saml_login()
-    return (
-        f"Perforce ticket expired. Open this URL in your browser to log in:\n\n"
-        f"  {url}\n\n"
-        f"After authenticating in the browser, your p4 ticket will be active.\n"
-        f"Run p4_login again to confirm."
-    )
+    if _try_keychain_login():
+        return f"Auto-logged in from Keychain. {_ticket_status()}"
+
+    ok, msg = _do_saml_login()
+    if ok:
+        return f"{msg} {_ticket_status()}"
+    return msg
+
+
+@mcp.tool()
+def save_p4_password(password: str) -> str:
+    """Store your Perforce password in macOS Keychain for automatic login renewal.
+
+    This is a one-time setup. After this, every p4 command will silently
+    re-authenticate when the ticket expires — no more manual `p4 login`.
+
+    The password is stored securely in the macOS Keychain under the service
+    name 'p4-workflow' and is never written to disk or logs.
+
+    Args:
+        password: Your Perforce password (P4PASSWD)
+    """
+    if not _login_with_password(password):
+        return (
+            "Login failed — check that the password is correct "
+            "and VPN is connected."
+        )
+    if _keychain_write(password):
+        return (
+            f"Password saved to Keychain and login successful.\n"
+            f"{_ticket_status()}\n"
+            f"All future p4 operations will auto-renew the ticket silently."
+        )
+    return "Login succeeded but Keychain save failed. The ticket is active for now."
 
 
 # ── Workflow tools ────────────────────────────────────────────────────────────
