@@ -1,256 +1,223 @@
-# Agentic IDE: Perforce + Swarm MCP — Demo Guide
+# Perforce + Swarm MCP Server
 
-## The Pitch (30 seconds)
-
-> "I built an MCP server that gives Cursor AI full Perforce and Swarm superpowers.
-> You talk to the AI in plain English — it creates changelists with the Cisco template,
-> checks out files, shelves, raises Swarm reviews, fetches diffs, adds comments.
-> Auth is zero-touch — Keychain or browser SSO, fully automatic, no terminal needed."
+Give your AI-powered IDE native Perforce and Swarm code review capabilities — zero manual steps.
 
 ---
 
-## Problem → Solution (2 minutes)
+## What is MCP?
 
-### Before (the old way)
+**Model Context Protocol** is an open standard that lets AI IDEs (Cursor, VS Code Copilot, Windsurf) call external tools. Instead of copy-pasting terminal output into chat, the AI calls the tool directly and gets structured results back.
 
-| Step | What you did manually |
-|------|----------------------|
-| 1 | Terminal: `p4 login` → copy URL → open browser → SSO → come back |
-| 2 | Terminal: `p4 change` → edit spec → fill in Cisco template by hand |
-| 3 | Terminal: `p4 edit -c 12345 //depot/path/to/file.pm` |
-| 4 | Edit code in IDE |
-| 5 | Terminal: `p4 shelve -f -c 12345` |
-| 6 | Browser: Go to Swarm → create review manually |
-| 7 | Browser: Swarm → add reviewers → submit |
-| 8 | Later: terminal `p4 shelve -f -c 12345` again to push updates |
-
-**8 context switches** between IDE, terminal, and browser. Every. Single. Time.
-
-### After (with MCP)
-
-| Step | What you say to the AI |
-|------|------------------------|
-| 1 | "Create a changelist for CSCwt43076 in IMS_10_5_MAIN" |
-| 2 | "Check out COOP.pm in that CL" |
-| 3 | Edit code in IDE (AI can help) |
-| 4 | "Raise a Swarm review with reviewer jsmith" |
-| 5 | "Push my latest changes to the review" |
-
-**Zero context switches.** Auth is invisible. Template is automatic. One IDE for everything.
+| Without MCP | With MCP |
+|---|---|
+| Run `p4 describe` in terminal, copy output, paste into chat, ask AI to review it, copy feedback, go to Swarm, paste comment. | Say "review Swarm 5012947". The AI fetches the diff, analyzes it, and posts comments — all in one step. |
 
 ---
 
-## Architecture Slide
+## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    Cursor IDE                        │
-│                                                      │
-│  User ──► AI Agent ──► MCP Protocol ──┐              │
-│                                       │              │
-│            ┌──────────────────────────┼──────────┐   │
-│            │      mcp.json            │          │   │
-│            │                          ▼          │   │
-│            │   ┌──────────────────────────────┐  │   │
-│            │   │   p4-workflow (server.py)    │  │   │
-│            │   │   • FastMCP Python server    │  │   │
-│            │   │   • 10 tools                 │  │   │
-│            │   │   • Zero-touch auth          │  │   │
-│            │   │   • Cisco IMS template       │  │   │
-│            │   └───────┬──────────┬───────────┘  │   │
-│            │           │          │               │   │
-│            │           ▼          ▼               │   │
-│            │     Perforce     Swarm API           │   │
-│            │     (p4 CLI)    (HTTP/REST)          │   │
-│            │                                      │   │
-│            │   ┌──────────────────────────────┐   │   │
-│            │   │  perforce-p4 (official)      │   │   │
-│            │   │  • Helix MCP Server binary   │   │   │
-│            │   │  • File queries, history     │   │   │
-│            │   │  • Workspace management      │   │   │
-│            │   └──────────────────────────────┘   │   │
-│            └──────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────┘
+Two MCP servers run locally on your machine. The IDE talks to them over stdio. They talk to Perforce and Swarm on your behalf.
+
+```mermaid
+flowchart LR
+  IDE["AI IDE<br/>(Cursor)"]
+  PW["p4-workflow<br/><i>Python / FastMCP</i>"]
+  PP["perforce-p4<br/><i>Official binary</i>"]
+  P4["Perforce Server<br/><i>Helix Core</i>"]
+  SW["Swarm Server<br/><i>Code Review</i>"]
+  KC["macOS Keychain"]
+
+  IDE -- "create CL, raise review,<br/>get diff, comment" --> PW
+  IDE -- "query files, history,<br/>workspaces" --> PP
+  PW -- "p4 CLI<br/>(subprocess)" --> P4
+  PW -- "REST API<br/>(httpx)" --> SW
+  PP -- "p4 CLI" --> P4
+  PW -. "auto-login" .-> KC
 ```
 
-### Auth Flow (zero-touch)
+| Server | Role |
+|---|---|
+| **p4-workflow** (custom) | Mutations and Swarm integration. Create CLs with Cisco template, shelve, raise reviews, fetch diffs, post comments. |
+| **perforce-p4** (official) | Read-only depot queries. File content, history, annotations, workspace management, server info. |
 
+---
+
+## How `raise_review` Works
+
+One tool call. Under the hood it coordinates three separate operations against two systems.
+
+```mermaid
+sequenceDiagram
+  participant IDE as AI IDE
+  participant MCP as p4-workflow
+  participant P4 as Perforce
+  participant SW as Swarm
+
+  IDE->>MCP: raise_review(CL 4990352)
+  MCP->>P4: p4 change -o 4990352
+  P4-->>MCP: CL spec (client, description)
+  MCP->>P4: p4 opened -c 4990352
+  P4-->>MCP: list of open files
+  MCP->>P4: p4 shelve -f -c 4990352 [files]
+  P4-->>MCP: shelved OK
+  MCP->>SW: POST /api/v9/reviews {change: 4990352}
+  SW-->>MCP: {review: {id: 5019391, state: "needsReview"}}
+  MCP-->>IDE: "Review 5019391 raised. URL: .../reviews/5019391"
 ```
-Any p4 command
-  │
-  ├─ Ticket valid? ──► Execute ──► Done
-  │
-  ├─ Keychain password? ──► p4 login ──► Retry ──► Done
-  │
-  └─ SAML/SSO ──► Auto-open browser ──► Wait ──► Retry ──► Done
-                   (no copy-paste)
+
+**Step 1 — Detect workspace**: `p4 change -o` reads the CL spec to find which P4CLIENT owns it — no need to pass workspace manually.
+
+**Step 2 — Shelve files**: `p4 opened -c` lists all files in the CL, then `p4 shelve -f -c` force-shelves them. This is what Swarm reads.
+
+**Step 3 — Create Swarm review**: A single `POST /api/v9/reviews` with the CL number and description. Swarm links the shelved files to the new review.
+
+---
+
+## How `update_review` Works
+
+After making more code changes, one call re-shelves the files. Swarm auto-detects the new shelf and creates a new version.
+
+```mermaid
+sequenceDiagram
+  participant IDE as AI IDE
+  participant MCP as p4-workflow
+  participant P4 as Perforce
+  participant SW as Swarm
+
+  IDE->>MCP: update_review(CL 4990352)
+  MCP->>P4: p4 opened -c 4990352
+  P4-->>MCP: file list
+  MCP->>P4: p4 shelve -f -c 4990352 [files]
+  P4-->>MCP: shelved OK
+  Note over SW: Swarm auto-detects new shelf → new version
+  MCP-->>IDE: "CL 4990352 re-shelved. Swarm auto-versioned."
 ```
 
 ---
 
-## Live Demo Script
+## Authentication
 
-### Demo 1: Zero-to-Working Setup (2 min)
+Fully automatic. The user never runs `p4 login` manually.
 
-> Show this if audience hasn't seen the setup before.
-
+```mermaid
+flowchart TD
+  A["p4 command fails (ticket expired)"] --> B{Keychain password?}
+  B -- yes --> C["p4 login (pipe password)"]
+  C --> D{Success?}
+  D -- yes --> E["Retry original command"]
+  B -- no --> F["p4 login (SAML/SSO)"]
+  D -- no --> F
+  F --> G["Extract URL, auto-open browser"]
+  G --> H["Wait for SSO completion"]
+  H --> I{Ticket valid?}
+  I -- yes --> E
+  I -- no --> J["Return error"]
 ```
-1. Open terminal in the repo
-2. Run: ./setup.sh
-3. It asks for P4USER, P4PORT, workspace name
-4. Installs everything, generates mcp.json, stores password in Keychain
-5. Restart Cursor
-6. Type: "List my pending changelists"
-   → AI uses perforce-p4 to query and show results
-```
 
-**Talking point:** "From a bare Mac to a fully working Perforce AI workflow — one script, 2 minutes."
+For Swarm API calls, the ticket is obtained from `p4 login -p`, cached for 20 hours, and auto-refreshed on HTTP 401.
 
 ---
 
-### Demo 2: Full Bug Fix Workflow (5 min) ← THE MAIN DEMO
+## Swarm API & Security
 
-> This is the money demo. Do this one live.
+All Swarm interactions use the **official Swarm REST API v9** — the same API that Swarm's own web UI calls.
 
-**Step 1 — Create the changelist**
-
-Type in Cursor chat:
-```
-Create a changelist for CSCwt43076 in workspace IMS_10_5_MAIN.
-Description: Fix HA sync skip when peer upgrade is running
-Root cause: Missing guard for upgrade-in-progress state in Transaction::HADC::Request
-Solution: Add upgrade state check before initiating periodic sync
-```
-
-**What happens:** AI calls `create_changelist` → CL created with full Cisco IMS template filled in. Show the CL number.
-
-**Step 2 — Check out a file**
+### API call: create a review
 
 ```
-Check out COOP.pm in that changelist
+POST /api/v9/reviews
+Auth: Basic (P4USER, p4_ticket_hash)
+Body: {"change": 4990352, "description": "Fixes: [devseth CSCwt43076] ..."}
 ```
 
-**What happens:** AI calls `checkout_file` with the local path → auto-converts to depot path → `p4 edit`.
+### How Swarm authentication works
 
-**Step 3 — Make a code change**
-
-Open the file, make a small edit (or let the AI do it). This part is normal IDE work.
-
-**Step 4 — Raise a Swarm review**
-
-```
-Raise a Swarm review for that CL with reviewer jsmith
+```mermaid
+flowchart LR
+  MCP["p4-workflow"] -- "p4 login -p" --> P4["Perforce"]
+  P4 -- "hex ticket hash" --> MCP
+  MCP -- "HTTP Basic Auth (user, ticket)" --> SW["Swarm API"]
+  SW -- "validates ticket against Perforce" --> P4
 ```
 
-**What happens:** AI calls `raise_review` → shelves files + creates Swarm review in ONE call. Returns the review URL.
+The ticket is a hex hash from `p4 login -p`, not your actual password. Swarm validates it against Perforce. Cached for 20 hours, auto-refreshed on HTTP 401.
 
-**Step 5 — Show the review**
+### Security boundaries
 
-```
-Show me the diff for that review
-```
-
-**What happens:** AI calls `get_review_diff` → fetches from Swarm API + runs `p4 describe -S` → shows full diff inline.
-
-**Step 6 — Push an update**
-
-Make another edit, then:
-```
-Push my changes to the review
-```
-
-**What happens:** AI calls `update_review` → re-shelves → Swarm auto-creates a new version.
+| Concern | How it's handled |
+|---|---|
+| Password storage | macOS Keychain only. Never written to disk, config files, or logs. |
+| Swarm auth | P4 ticket hash over HTTPS — same as Swarm web UI. No raw password sent. |
+| TLS verification | `verify=False` for internal self-signed cert. Traffic stays on corporate network (VPN required). |
+| Blast radius | Can only shelve files in *your* CLs and create reviews owned by *your* user. Cannot submit, delete, or modify other users' reviews. |
+| No undocumented APIs | All endpoints are from the official [Swarm API documentation](https://www.perforce.com/manuals/swarm/Content/Swarm/swarm-apidoc.html). |
 
 ---
 
-### Demo 3: Auth is Invisible (1 min)
+## Tools
 
-> Best shown if your ticket is actually expired. If not, describe it.
-
-**If ticket is expired:**
-```
-List my pending changelists
-```
-
-**What happens:** The command auto-detects expired ticket → tries Keychain → if Keychain fails → opens browser for SSO automatically → waits → retries → returns results. User does nothing except complete SSO in the browser that opened on its own.
-
-**Talking point:** "I never typed `p4 login`. I never copied a URL. The server handled everything. If Keychain is set up, you don't even see the browser — it's fully silent."
-
----
-
-### Demo 4: Review Any Colleague's Code (1 min)
-
-```
-Show me the diff for Swarm review 4960267
-```
-
-or
-
-```
-What files are in review 4990354?
-```
-
-**What happens:** AI calls `get_review_diff` or `get_review_info` → works for ANY review, not just yours.
-
-**Talking point:** "Code review without leaving the IDE. The AI can also analyze the diff and explain what changed."
+| Tool | What it does | Server |
+|---|---|---|
+| `create_changelist` | New CL with Cisco IMS template | p4-workflow |
+| `checkout_file` | Open file for edit in a CL | p4-workflow |
+| `raise_review` | Shelve + create Swarm review | p4-workflow |
+| `update_review` | Re-shelve; Swarm auto-versions | p4-workflow |
+| `get_review_diff` | Fetch full diff for any review | p4-workflow |
+| `get_review_info` | Metadata + file list (no diff) | p4-workflow |
+| `add_review_comment` | Post comment on a review | p4-workflow |
+| `update_description` | Update CL description (no char limit) | p4-workflow |
+| `query_files` | File content, history, annotations | perforce-p4 |
+| `query_changelists` | Search/list changelists | perforce-p4 |
+| `modify_files` | Add, edit, delete, revert files | perforce-p4 |
 
 ---
 
-## Key Numbers for the Slide
+## Setup
 
-| Metric | Value |
-|--------|-------|
-| Lines of code (server.py) | ~740 |
-| External dependencies | 2 (fastmcp, httpx) |
-| Tools exposed | 10 |
-| Setup time (bare Mac) | ~3 minutes |
-| Context switches per code review | 0 (was 8+) |
-| Auth handling | Fully automatic |
-| Template compliance | 100% (Cisco IMS template built-in) |
+```bash
+git clone <repo>
+cd p4v-swarm-mcp-server
+./setup.sh
+```
+
+The script handles everything from a bare macOS machine: Homebrew, p4 CLI, Python, Node.js, dependencies, authentication, MCP config, and AI rules/skills. One command, restart the IDE, done.
 
 ---
 
-## Anticipated Questions
+## FAQ
 
-**Q: Why not just use the official Perforce MCP server?**
-> It handles queries well but doesn't know about Cisco's CL template, doesn't integrate with Swarm's review API, and has a 2000-char limit on descriptions. p4-workflow fills those gaps. They work side by side.
+**Does this modify any files on the Perforce server?**
+Only when you explicitly ask it to (create CL, shelve, raise review). Read operations like `get_review_diff` are read-only.
 
-**Q: Is the password safe in Keychain?**
-> Yes — macOS Keychain is hardware-backed on Apple Silicon (Secure Enclave). It's the same store that Safari uses for passwords. Never written to disk or logs.
+**How does the AI know my Perforce password?**
+It doesn't. The password is stored in macOS Keychain (one-time setup). The MCP server reads it from Keychain at runtime to refresh the P4 ticket. No passwords in config files or environment variables.
 
-**Q: Does it work with other IDEs?**
-> Any IDE that supports MCP (Model Context Protocol). Today that's Cursor. VS Code + GitHub Copilot are adding MCP support. The server is IDE-agnostic — it's just a Python process speaking JSON over stdio.
+**What if I don't store a password in Keychain?**
+SAML/SSO still works. When the ticket expires, your default browser opens the SSO page automatically. Complete the login, and the server continues — no copy-pasting URLs.
 
-**Q: Can other teams use this?**
-> Yes. `./setup.sh` handles everything. Clone the repo, run the script, restart IDE. Works for any Perforce server and any Swarm instance — just change the env vars.
+**Can I use this with VS Code / Windsurf / other IDEs?**
+Any IDE that supports MCP. The config lives in `~/.cursor/mcp.json` — adjust the path for your IDE's config location.
 
-**Q: What about CI/CD? Does this replace automation?**
-> No — this is for the developer inner loop (write code, raise review). CI/CD runs after the review is approved. They're complementary.
+**How does Swarm authentication work?**
+Swarm accepts `(P4USER, p4_ticket)` as HTTP Basic Auth. The server runs `p4 login -p` to get a ticket hash, caches it for 20 hours, and auto-refreshes on 401.
 
----
+**What's the difference between `raise_review` and `update_review`?**
+`raise_review` shelves files and creates a new Swarm review (first time). `update_review` just re-shelves — Swarm auto-detects the new shelf and adds a version to the existing review.
 
-## Presentation Order (recommended)
+**Does it work behind the Cisco VPN?**
+Yes. It requires VPN to reach the Perforce server and Swarm. If the connection drops, the error message tells you to check VPN.
 
-| # | Section | Time | Notes |
-|---|---------|------|-------|
-| 1 | The Pitch | 0:30 | Start with the one-liner |
-| 2 | Problem → Solution | 2:00 | Before/after comparison — this is what hooks people |
-| 3 | Architecture Slide | 1:00 | Quick, don't over-explain |
-| 4 | **Live Demo: Full Workflow** | 5:00 | The main event — Demo 2 above |
-| 5 | Auth Demo | 1:00 | Show or describe the zero-touch flow |
-| 6 | Review Colleague's Code | 1:00 | Quick "one more thing" |
-| 7 | Q&A | 2:00 | Use the anticipated questions above |
-| | **Total** | **~12 min** | |
+**Can the AI review someone else's code?**
+Yes. `get_review_diff(review_id)` works for any review — yours or a colleague's. Just provide the Swarm URL.
 
----
+**Can the AI submit my changelist (push to production)?**
+No. There is no `p4 submit` tool. Code can only be submitted through the normal review and approval process.
 
-## Pre-Demo Checklist
+**Does the AI see my password?**
+No. The password lives in Keychain and is read by the Python server process at runtime — piped into `p4 login` and discarded. It never appears in the MCP protocol messages or the AI's context window.
 
-- [ ] VPN connected
-- [ ] Cursor open with MCP servers green (check bottom status bar)
-- [ ] `p4 login -s` shows valid ticket
-- [ ] Have a test CDETS ID ready (e.g. CSCwt43076)
-- [ ] Know your workspace name (e.g. IMS_10_5_MAIN)
-- [ ] Have a file in mind to check out (e.g. COOP.pm)
-- [ ] Browser open in background (for SSO demo if needed)
-- [ ] Terminal visible showing `p4 login -s` result (to prove ticket before/after)
+**What happens if VPN drops mid-operation?**
+The `p4` command fails, the server catches it, and returns a clear error. Nothing is left in a partial state. Shelving is atomic.
+
+**What if my ticket expires mid-session?**
+Transparent recovery. The server detects the auth error, tries Keychain (instant), retries the command. If Keychain isn't set up, it opens the browser for SSO, waits, and retries. You see the result, not the retry.

@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Perforce + Swarm MCP Server</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .container { max-width: 960px; margin: 0 auto; padding: 48px 24px; }
+
+  /* Hero */
+  .hero {
+    text-align: center;
+    padding: 80px 0 48px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 48px;
+  }
+  .hero h1 { font-size: 2.4rem; font-weight: 700; margin-bottom: 12px; }
+  .hero p { font-size: 1.15rem; color: var(--muted); max-width: 600px; margin: 0 auto; }
+
+  /* Sections */
+  section { margin-bottom: 56px; }
+  h2 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 20px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--accent);
+  }
+  h3 { font-size: 1.1rem; font-weight: 600; margin: 24px 0 12px; }
+  p, li { color: var(--text); margin-bottom: 8px; }
+  ul { padding-left: 20px; }
+
+  /* Cards */
+  .card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+  }
+  .card h4 { color: var(--accent); font-size: 0.95rem; margin-bottom: 6px; }
+  .card p { color: var(--muted); font-size: 0.9rem; margin: 0; }
+
+  /* Diagram container */
+  .diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    margin: 20px 0;
+    overflow-x: auto;
+    text-align: center;
+  }
+
+  /* Steps */
+  .step {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    margin-bottom: 16px;
+  }
+  .step-num {
+    flex-shrink: 0;
+    width: 32px; height: 32px;
+    background: var(--accent);
+    color: var(--bg);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.85rem;
+  }
+  .step-body h4 { font-size: 0.95rem; margin-bottom: 2px; }
+  .step-body p { color: var(--muted); font-size: 0.9rem; margin: 0; }
+
+  /* Code */
+  code {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    background: var(--surface);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.88rem;
+    color: var(--green);
+  }
+  pre {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    font-size: 0.88rem;
+    margin: 12px 0;
+  }
+  pre code { background: none; padding: 0; color: var(--text); }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  td code { font-size: 0.85rem; }
+
+  /* FAQ */
+  details {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+  }
+  summary {
+    padding: 14px 18px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  summary:hover { color: var(--accent); }
+  details > div { padding: 0 18px 14px; color: var(--muted); font-size: 0.9rem; }
+
+  /* Tag */
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .tag-blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tag-green { background: rgba(63,185,80,0.15); color: var(--green); }
+  .tag-orange { background: rgba(210,153,34,0.15); color: var(--orange); }
+
+  @media (max-width: 640px) {
+    .card-grid { grid-template-columns: 1fr; }
+    .hero h1 { font-size: 1.8rem; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<!-- ─── Hero ─── -->
+<div class="hero">
+  <h1>Perforce + Swarm MCP Server</h1>
+  <p>Give your AI-powered IDE native Perforce and Swarm code review capabilities — zero manual steps.</p>
+</div>
+
+<!-- ─── What is MCP ─── -->
+<section>
+  <h2>What is MCP?</h2>
+  <p><strong>Model Context Protocol</strong> is an open standard that lets AI IDEs (Cursor, VS Code Copilot, Windsurf) call external tools. Instead of copy-pasting terminal output into chat, the AI calls the tool directly and gets structured results back.</p>
+  <div class="card-grid">
+    <div class="card">
+      <h4>Without MCP</h4>
+      <p>You run <code>p4 describe</code> in terminal, copy output, paste into chat, ask AI to review it, copy its feedback, go to Swarm, paste comment.</p>
+    </div>
+    <div class="card">
+      <h4>With MCP</h4>
+      <p>You say "review Swarm 5012947". The AI fetches the diff, analyzes it, and posts comments — all in one step.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Architecture ─── -->
+<section>
+  <h2>Architecture</h2>
+  <p>Two MCP servers run locally on your machine. The IDE talks to them over stdio. They talk to Perforce and Swarm on your behalf.</p>
+  <div class="diagram">
+    <pre class="mermaid">
+flowchart LR
+  IDE["AI IDE<br/>(Cursor)"]
+  PW["p4-workflow<br/><i>Python / FastMCP</i>"]
+  PP["perforce-p4<br/><i>Official binary</i>"]
+  P4["Perforce Server<br/><i>Helix Core</i>"]
+  SW["Swarm Server<br/><i>Code Review</i>"]
+  KC["macOS Keychain"]
+
+  IDE -- "create CL, raise review,<br/>get diff, comment" --> PW
+  IDE -- "query files, history,<br/>workspaces" --> PP
+  PW -- "p4 CLI<br/>(subprocess)" --> P4
+  PW -- "REST API<br/>(httpx)" --> SW
+  PP -- "p4 CLI" --> P4
+  PW -. "auto-login" .-> KC
+
+  style IDE fill:#1f6feb,stroke:#58a6ff,color:#fff
+  style PW fill:#238636,stroke:#3fb950,color:#fff
+  style PP fill:#6e40c9,stroke:#bc8cff,color:#fff
+  style P4 fill:#b62324,stroke:#f85149,color:#fff
+  style SW fill:#9e6a03,stroke:#d29922,color:#fff
+  style KC fill:#30363d,stroke:#8b949e,color:#e6edf3
+    </pre>
+  </div>
+  <div class="card-grid">
+    <div class="card">
+      <h4>p4-workflow <span class="tag tag-green">custom</span></h4>
+      <p>Mutations and Swarm integration. Create CLs with Cisco template, shelve, raise reviews, fetch diffs, post comments.</p>
+    </div>
+    <div class="card">
+      <h4>perforce-p4 <span class="tag tag-blue">official</span></h4>
+      <p>Read-only depot queries. File content, history, annotations, workspace management, server info.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ─── How Raise Review Works ─── -->
+<section>
+  <h2>How <code>raise_review</code> Works</h2>
+  <p>One tool call. Under the hood it coordinates three separate operations against two systems.</p>
+  <div class="diagram">
+    <pre class="mermaid">
+sequenceDiagram
+  participant IDE as AI IDE
+  participant MCP as p4-workflow
+  participant P4 as Perforce
+  participant SW as Swarm
+
+  IDE->>MCP: raise_review(CL 4990352)
+  MCP->>P4: p4 change -o 4990352
+  P4-->>MCP: CL spec (client, description)
+  MCP->>P4: p4 opened -c 4990352
+  P4-->>MCP: list of open files
+  MCP->>P4: p4 shelve -f -c 4990352 [files]
+  P4-->>MCP: shelved OK
+  MCP->>SW: POST /api/v9/reviews<br/>{change: 4990352, description: "..."}
+  SW-->>MCP: {review: {id: 5019391, state: "needsReview"}}
+  MCP-->>IDE: "Review 5019391 raised.<br/>URL: .../reviews/5019391"
+    </pre>
+  </div>
+  <h3>What happens at each step</h3>
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <h4>Detect workspace</h4>
+      <p><code>p4 change -o</code> reads the CL spec to find which P4CLIENT owns it — no need to pass workspace manually.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <h4>Shelve files</h4>
+      <p><code>p4 opened -c</code> lists all files in the CL, then <code>p4 shelve -f -c</code> force-shelves them. This is what Swarm reads.</p>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <h4>Create Swarm review</h4>
+      <p>A single <code>POST /api/v9/reviews</code> with the CL number and description. Swarm links the shelved files to the new review.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ─── How update_review Works ─── -->
+<section>
+  <h2>How <code>update_review</code> Works</h2>
+  <p>After making more code changes, one call re-shelves the files. Swarm auto-detects the new shelf and creates a new version.</p>
+  <div class="diagram">
+    <pre class="mermaid">
+sequenceDiagram
+  participant IDE as AI IDE
+  participant MCP as p4-workflow
+  participant P4 as Perforce
+  participant SW as Swarm
+
+  IDE->>MCP: update_review(CL 4990352)
+  MCP->>P4: p4 opened -c 4990352
+  P4-->>MCP: file list
+  MCP->>P4: p4 shelve -f -c 4990352 [files]
+  P4-->>MCP: shelved OK
+  Note over SW: Swarm auto-detects<br/>new shelf → new version
+  MCP-->>IDE: "CL 4990352 re-shelved.<br/>Swarm auto-versioned."
+    </pre>
+  </div>
+</section>
+
+<!-- ─── Auth ─── -->
+<section>
+  <h2>Authentication</h2>
+  <p>Fully automatic. The user never runs <code>p4 login</code> manually.</p>
+  <div class="diagram">
+    <pre class="mermaid">
+flowchart TD
+  A["p4 command fails<br/>(ticket expired)"] --> B{Keychain<br/>password?}
+  B -- yes --> C["p4 login<br/>(pipe password)"]
+  C --> D{Success?}
+  D -- yes --> E["Retry original<br/>command ✓"]
+  B -- no --> F["p4 login<br/>(SAML/SSO)"]
+  D -- no --> F
+  F --> G["Extract URL,<br/>auto-open browser"]
+  G --> H["Wait for SSO<br/>completion"]
+  H --> I{Ticket<br/>valid?}
+  I -- yes --> E
+  I -- no --> J["Return error"]
+
+  style A fill:#b62324,stroke:#f85149,color:#fff
+  style E fill:#238636,stroke:#3fb950,color:#fff
+  style J fill:#b62324,stroke:#f85149,color:#fff
+    </pre>
+  </div>
+  <p>For Swarm API calls, the ticket is obtained from <code>p4 login -p</code>, cached for 20 hours, and auto-refreshed on HTTP 401.</p>
+</section>
+
+<!-- ─── Swarm API & Security ─── -->
+<section>
+  <h2>Swarm API &amp; Security</h2>
+  <p>All Swarm interactions use the <strong>official Swarm REST API v9</strong> — the same API that Swarm's own web UI calls.</p>
+
+  <h3>API call: create a review</h3>
+  <pre><code>POST /api/v9/reviews
+Auth: Basic (P4USER, p4_ticket_hash)
+Body: {"change": 4990352, "description": "Fixes: [devseth CSCwt43076] ..."}</code></pre>
+
+  <h3>How authentication works</h3>
+  <div class="diagram">
+    <pre class="mermaid">
+flowchart LR
+  MCP["p4-workflow"] -- "p4 login -p" --> P4["Perforce"]
+  P4 -- "hex ticket hash" --> MCP
+  MCP -- "HTTP Basic Auth<br/>(user, ticket)" --> SW["Swarm API"]
+  SW -- "validates ticket<br/>against Perforce" --> P4
+
+  style MCP fill:#238636,stroke:#3fb950,color:#fff
+  style P4 fill:#b62324,stroke:#f85149,color:#fff
+  style SW fill:#9e6a03,stroke:#d29922,color:#fff
+    </pre>
+  </div>
+  <p>The ticket is a hex hash from <code>p4 login -p</code>, not your actual password. Swarm validates it against Perforce. Cached for 20 hours, auto-refreshed on HTTP 401.</p>
+
+  <h3>Security boundaries</h3>
+  <table>
+    <tr><th>Concern</th><th>How it's handled</th></tr>
+    <tr><td>Password storage</td><td>macOS Keychain only. Never written to disk, config files, or logs.</td></tr>
+    <tr><td>Swarm auth</td><td>P4 ticket hash over HTTPS — same as Swarm web UI. No raw password sent.</td></tr>
+    <tr><td>TLS verification</td><td><code>verify=False</code> for internal self-signed cert. Traffic stays on corporate network (VPN required).</td></tr>
+    <tr><td>Blast radius</td><td>Can only shelve files in <em>your</em> CLs and create reviews owned by <em>your</em> user. Cannot submit, delete, or modify other users' reviews.</td></tr>
+    <tr><td>No undocumented APIs</td><td>All endpoints are from the official <a href="https://www.perforce.com/manuals/swarm/Content/Swarm/swarm-apidoc.html" style="color:var(--accent)">Swarm API documentation</a>.</td></tr>
+  </table>
+</section>
+
+<!-- ─── Tool Reference ─── -->
+<section>
+  <h2>Tools</h2>
+  <table>
+    <tr><th>Tool</th><th>What it does</th><th>Server</th></tr>
+    <tr><td><code>create_changelist</code></td><td>New CL with Cisco IMS template</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>checkout_file</code></td><td>Open file for edit in a CL</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>raise_review</code></td><td>Shelve + create Swarm review</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>update_review</code></td><td>Re-shelve → Swarm auto-versions</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>get_review_diff</code></td><td>Fetch full diff for any review</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>get_review_info</code></td><td>Metadata + file list (no diff)</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>add_review_comment</code></td><td>Post comment on a review</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>update_description</code></td><td>Update CL description (no char limit)</td><td><span class="tag tag-green">p4-workflow</span></td></tr>
+    <tr><td><code>query_files</code></td><td>File content, history, annotations</td><td><span class="tag tag-blue">perforce-p4</span></td></tr>
+    <tr><td><code>query_changelists</code></td><td>Search/list changelists</td><td><span class="tag tag-blue">perforce-p4</span></td></tr>
+    <tr><td><code>modify_files</code></td><td>Add, edit, delete, revert files</td><td><span class="tag tag-blue">perforce-p4</span></td></tr>
+  </table>
+</section>
+
+<!-- ─── Setup ─── -->
+<section>
+  <h2>Setup</h2>
+  <pre><code>git clone &lt;repo&gt;
+cd p4v-swarm-mcp-server
+./setup.sh</code></pre>
+  <p>The script handles everything from a bare macOS machine: Homebrew, p4 CLI, Python, Node.js, dependencies, authentication, MCP config, and AI rules/skills. One command, restart the IDE, done.</p>
+</section>
+
+<!-- ─── FAQ ─── -->
+<section>
+  <h2>FAQ</h2>
+
+  <details>
+    <summary>Does this modify any files on the Perforce server?</summary>
+    <div>Only when you explicitly ask it to (create CL, shelve, raise review). Read operations like <code>get_review_diff</code> are read-only.</div>
+  </details>
+
+  <details>
+    <summary>How does the AI know my Perforce password?</summary>
+    <div>It doesn't. The password is stored in macOS Keychain (one-time setup). The MCP server reads it from Keychain at runtime to refresh the P4 ticket. No passwords in config files or environment variables.</div>
+  </details>
+
+  <details>
+    <summary>What if I don't store a password in Keychain?</summary>
+    <div>SAML/SSO still works. When the ticket expires, your default browser opens the SSO page automatically. Complete the login, and the server continues — no copy-pasting URLs.</div>
+  </details>
+
+  <details>
+    <summary>Can I use this with VS Code / Windsurf / other IDEs?</summary>
+    <div>Any IDE that supports MCP. The config lives in <code>~/.cursor/mcp.json</code> — adjust the path for your IDE's config location.</div>
+  </details>
+
+  <details>
+    <summary>How does Swarm authentication work?</summary>
+    <div>Swarm accepts <code>(P4USER, p4_ticket)</code> as HTTP Basic Auth. The server runs <code>p4 login -p</code> to get a ticket hash, caches it for 20 hours, and auto-refreshes on 401.</div>
+  </details>
+
+  <details>
+    <summary>What's the difference between <code>raise_review</code> and <code>update_review</code>?</summary>
+    <div><code>raise_review</code> shelves files and creates a new Swarm review (first time). <code>update_review</code> just re-shelves — Swarm auto-detects the new shelf and adds a version to the existing review.</div>
+  </details>
+
+  <details>
+    <summary>Does it work behind the Cisco VPN?</summary>
+    <div>Yes. It requires VPN to reach the Perforce server and Swarm. If the connection drops, the error message tells you to check VPN.</div>
+  </details>
+
+  <details>
+    <summary>Can the AI review someone else's code?</summary>
+    <div>Yes. <code>get_review_diff(review_id)</code> works for any review — yours or a colleague's. Just provide the Swarm URL.</div>
+  </details>
+</section>
+
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor: '#238636',
+      primaryTextColor: '#e6edf3',
+      primaryBorderColor: '#3fb950',
+      lineColor: '#8b949e',
+      secondaryColor: '#161b22',
+      tertiaryColor: '#161b22',
+      background: '#0d1117',
+      mainBkg: '#161b22',
+      nodeBorder: '#30363d',
+      clusterBkg: '#161b22',
+      titleColor: '#e6edf3',
+      edgeLabelBackground: '#0d1117',
+      actorBkg: '#161b22',
+      actorBorder: '#58a6ff',
+      actorTextColor: '#e6edf3',
+      signalColor: '#8b949e',
+      signalTextColor: '#e6edf3',
+      noteBkgColor: '#1f2937',
+      noteTextColor: '#e6edf3',
+      noteBorderColor: '#30363d',
+      activationBkgColor: '#1f2937',
+      activationBorderColor: '#58a6ff',
+    },
+    flowchart: { curve: 'basis', padding: 16 },
+    sequence: { mirrorActors: false, messageMargin: 40, actorMargin: 80 }
+  });
+</script>
+</body>
+</html>
