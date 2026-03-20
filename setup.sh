@@ -324,17 +324,26 @@ MCPEOF
 ok "Created: $MCP_JSON"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Step 9: Install Cursor rules
+# Step 9: Install Cursor rules and skills
 # ═══════════════════════════════════════════════════════════════════════════════
-step "9/9" "Installing Cursor rules..."
+step "9/9" "Installing Cursor rules and skills..."
+
 RULES_DIR="$HOME/.cursor/rules"
-mkdir -p "$RULES_DIR"
+SKILLS_DIR="$HOME/.cursor/skills/p4-workflow"
+mkdir -p "$RULES_DIR" "$SKILLS_DIR"
 
 if [[ -f "$SCRIPT_DIR/rules/p4-workflow.mdc" ]]; then
     cp "$SCRIPT_DIR/rules/p4-workflow.mdc" "$RULES_DIR/p4-workflow.mdc"
-    ok "Installed: $RULES_DIR/p4-workflow.mdc"
+    ok "Rule:  $RULES_DIR/p4-workflow.mdc"
 else
-    warn "No rules file found at $SCRIPT_DIR/rules/p4-workflow.mdc — skipping."
+    warn "No rules file at $SCRIPT_DIR/rules/p4-workflow.mdc — skipping."
+fi
+
+if [[ -f "$SCRIPT_DIR/skills/p4-workflow/SKILL.md" ]]; then
+    cp "$SCRIPT_DIR/skills/p4-workflow/SKILL.md" "$SKILLS_DIR/SKILL.md"
+    ok "Skill: $SKILLS_DIR/SKILL.md"
+else
+    warn "No skill file at $SCRIPT_DIR/skills/p4-workflow/SKILL.md — skipping."
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -350,7 +359,8 @@ echo "  p4 CLI:          $P4_BIN"
 [[ -n "${P4_MCP_BIN:-}" ]] && echo "  p4-mcp-server:   $P4_MCP_BIN"
 echo "  Python deps:     fastmcp, httpx"
 echo "  MCP config:      $MCP_JSON"
-echo "  Cursor rules:    $RULES_DIR/p4-workflow.mdc"
+echo "  Cursor rule:     $RULES_DIR/p4-workflow.mdc"
+echo "  Cursor skill:    $SKILLS_DIR/SKILL.md"
 echo ""
 echo "Next steps:"
 echo "  1. Restart your IDE (Cmd+Q, then reopen)"

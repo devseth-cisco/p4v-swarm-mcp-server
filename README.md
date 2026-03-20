@@ -28,7 +28,7 @@ chmod +x setup.sh
 | Python deps | `pip3 install fastmcp httpx` |
 | Auth | Interactive P4 login + macOS Keychain storage |
 | MCP config | Auto-generates `~/.cursor/mcp.json` |
-| AI rules | Installs workflow rules to `~/.cursor/rules/` |
+| AI rules + skill | Installs rule and skill to `~/.cursor/` |
 
 After setup, restart your IDE (Cmd+Q, reopen) and test:
 ```
@@ -185,7 +185,10 @@ p4v-swarm-mcp-server/
   .cursor/rules/
     setup-guide.mdc             <- Tells Cursor AI how to set up this repo
   rules/
-    p4-workflow.mdc             <- Workflow rules (installed globally by setup.sh)
+    p4-workflow.mdc             <- Always-on rule (installed to ~/.cursor/rules/)
+  skills/
+    p4-workflow/
+      SKILL.md                  <- Agent skill (installed to ~/.cursor/skills/)
   perforce-p4/
     p4-mcp-start.sh             <- Wrapper script for official MCP server
   p4-workflow/

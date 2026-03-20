@@ -25,7 +25,7 @@ The setup script handles EVERYTHING from a bare macOS machine:
 7. Tests Perforce connectivity
 8. Authenticates + saves password to macOS Keychain
 9. Generates ~/.cursor/mcp.json with correct paths
-10. Installs Cursor AI workflow rules globally
+10. Installs Cursor rule and skill globally
 
 After setup completes, the user must restart Cursor (Cmd+Q, reopen).
 
@@ -35,5 +35,6 @@ After setup completes, the user must restart Cursor (Cmd+Q, reopen).
 - `perforce-p4/p4-mcp-start.sh` — Wrapper for official Perforce MCP server
 - `p4-workflow/server.py` — Custom Perforce + Swarm workflow MCP server
 - `p4-workflow/requirements.txt` — Python dependencies
-- `rules/p4-workflow.mdc` — Cursor AI rules for workflow guidance
+- `rules/p4-workflow.mdc` — Always-on Cursor rule
+- `skills/p4-workflow/SKILL.md` — Agent skill (when to use the tools)
 - `mcp.json.template` — Manual config reference
