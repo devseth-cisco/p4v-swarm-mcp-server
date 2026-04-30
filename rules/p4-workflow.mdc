@@ -10,55 +10,52 @@ You have two MCP servers for Perforce operations. Use them correctly:
 
 ## Server Selection
 
-- **perforce-p4** (official): Use for querying files, changelists, workspaces, server info, and basic CRUD.
-- **p4-workflow** (custom): Use for the full workflow — creating CLs, checking out files, shelving, raising reviews, fetching diffs, and auth.
+- **p4-workflow** (custom): Use for ALL workflow operations — status checks, CL management, shelving, reviews, diffs, auth.
+- **perforce-p4** (official): Use for read-only depot queries — file content, history, annotations, workspace info.
 
-When both servers could handle a task, prefer **p4-workflow** for anything involving:
-- Creating changelists (it applies the correct Cisco IMS template)
-- Shelving / raising reviews (one-call operations)
-- Fetching review diffs (combines Swarm API + p4 describe)
-- Auth issues (has Keychain auto-login)
+Always prefer **p4-workflow** when both could handle a task.
 
-Use **perforce-p4** for:
-- Querying file content, history, annotations
-- Listing changelists with filters
-- Workspace management
-- Server info / connection status
+## Start Every Session With
 
-## Workflow: Bug Fix → Review
+Call `p4_status` first. It returns auth state, workspace, all pending CLs, and Swarm reachability in one shot.
 
-1. **Create CL**: `create_changelist(bug_id, workspace, description, root_cause, solution)`
+## Workflow: Bug Fix -> Review
+
+1. **Check status**: `p4_status()` — confirms auth, shows pending CLs
+2. **Create CL**: `create_changelist(bug_id, workspace, description, root_cause, solution)`
    - Workspace short name only (e.g. `7_4_1_MAIN`), prefix auto-added
-   - Template is auto-filled; provide only the required fields
-
-2. **Checkout files**: `checkout_file(file_path, changelist_id)`
+3. **Checkout files**: `checkout_file(file_path, changelist_id)`
    - Accepts local paths OR depot paths — auto-converts
-   - Workspace auto-detected from CL
+4. **Edit code** in the IDE as normal
+5. **Push to review**: `push_to_review(changelist_id=..., reviewers=[...])`
+   - Creates a NEW review if none exists, or UPDATES the existing one
+   - Returns the exact Swarm version number created
+6. **Check any review**: `get_review_diff(review_id)` or `get_review_info(review_id)`
 
-3. **Edit code**: Make changes in the IDE as normal
+## Updating an Existing Review
 
-4. **Raise review**: `raise_review(changelist_id, reviewers=[...], required_reviewers=[...])`
-   - Shelves + creates Swarm review in ONE call
-   - Description auto-read from CL
+Use `push_to_review` with EITHER:
+- `changelist_id` — if you know the CL number
+- `review_id` — if you only have the Swarm review URL/number (auto-resolves to the CL)
 
-5. **Update review**: `update_review(changelist_id)`
-   - After more edits, just re-shelve — Swarm auto-versions
+Do NOT ask the user to look up CL numbers manually. Use `list_pending_cls` or pass the `review_id` directly.
 
-6. **Fetch any review**: `get_review_diff(review_id)` or `get_review_info(review_id)`
-   - Works for ANY review (yours or colleagues')
+## Finding CLs
+
+- `list_pending_cls()` — shows all pending CLs with file counts
+- `list_pending_cls(workspace='IMS_10_5_MAIN')` — filtered to one workspace
+- `p4_status()` — includes pending CLs plus auth/connectivity info
 
 ## Auth Rules
 
-- Auth is fully automatic — you never need to handle it manually:
-  - Every p4 command auto-retries with Keychain, then opens the browser for SSO if needed
-  - If a tool fails with an auth error, just retry — the server handles login silently
-  - `p4_login` exists but is rarely needed; `save_p4_password` is a one-time setup for fully silent auth
-  - Never ask the user to run terminal commands for auth — the server does it all
+- Auth is fully automatic — never handle it manually
+- Every p4 command auto-retries with Keychain, then opens browser for SSO
+- `save_p4_password` is a one-time setup for fully silent auth
+- Never ask the user to run terminal commands for auth
 
 ## Important Conventions
 
 - Workspace naming: `{username}_{branch}` (e.g. `devseth_7_4_1_MAIN`)
 - Only provide the branch part to tools; the username prefix is auto-added
-- CL descriptions follow the Cisco IMS template — do not deviate from it
+- CL descriptions follow the Cisco IMS template — do not deviate
 - When creating CLs, always ask for: bug_id, workspace, change_description, root_cause, solution
-- For update_description: use this to update CL descriptions without the 2000-char limit of the official server

@@ -1,15 +1,15 @@
 #!/bin/zsh
 # Wrapper for p4-mcp-server that:
-#   1. Sets P4PORT / P4USER / P4CLIENT from environment (passed by mcp.json)
-#   2. Auto-refreshes expired tickets: Keychain → SAML browser (zero-touch)
+#   1. Sets P4PORT / P4USER / P4CLIENT / P4TICKETS from environment
+#   2. Auto-refreshes expired tickets: Keychain -> SAML browser (zero-touch)
 #   3. Guards against P4CLIENT=none from stale .p4enviro
 #
-# All config comes from environment variables — no hardcoded placeholders.
 # Required env:  P4PORT, P4USER
-# Optional env:  P4CLIENT_DEFAULT, P4_BIN, P4_MCP_SERVER
+# Optional env:  P4CLIENT_DEFAULT, P4_BIN, P4_MCP_SERVER, P4TICKETS
 
 export P4PORT="${P4PORT:?P4PORT must be set}"
 export P4USER="${P4USER:?P4USER must be set}"
+export P4TICKETS="${P4TICKETS:-$HOME/.p4tickets}"
 
 P4_BIN="${P4_BIN:-$(command -v p4 2>/dev/null || echo "$HOME/bin/p4")}"
 P4_MCP_SERVER="${P4_MCP_SERVER:-$(echo "$HOME"/bin/p4-mcp-server*/p4-mcp-server)}"

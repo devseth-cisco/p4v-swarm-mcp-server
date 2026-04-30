@@ -9,11 +9,10 @@ All config is read from environment variables (set by mcp.json):
   SWARM_URL   -- Swarm base URL           (default: https://sp4-fp-swarm.cisco.com)
 
 Auth architecture (zero-touch):
-  1. Startup: validate ticket → Keychain auto-login if expired
-  2. Runtime: every _p4() call auto-handles auth (Keychain → SAML browser → retry)
+  1. Startup: validate ticket -> Keychain auto-login if expired
+  2. Runtime: every _p4() call auto-handles auth (Keychain -> SAML browser -> retry)
   3. Swarm: ticket cached 20h; auto-refreshes on 401; extracted from `p4 login -p`
-  4. User never sees auth errors — browser opens automatically when needed
-  5. save_p4_password: one-time Keychain setup for fully silent auth (no browser)
+  4. Both servers share P4TICKETS file so perforce-p4 never drifts out of sync
 """
 import logging
 import os
@@ -32,16 +31,15 @@ from fastmcp import FastMCP
 log = logging.getLogger("p4-workflow")
 
 # ── Config (from environment — set by mcp.json env block) ───────────────────
-P4_BIN  = os.environ.get("P4_BIN") or shutil.which("p4") or os.path.expanduser("~/bin/p4")
+P4_BIN = os.environ.get("P4_BIN") or shutil.which("p4") or os.path.expanduser("~/bin/p4")
 P4_PORT = os.environ["P4PORT"]
 P4_USER = os.environ["P4USER"]
+P4_TICKETS = os.environ.get("P4TICKETS", os.path.expanduser("~/.p4tickets"))
 
 SWARM_URL = os.environ.get("SWARM_URL", "https://sp4-fp-swarm.cisco.com")
 SWARM_API = f"{SWARM_URL}/api/v9"
 
-# ── Auth layer ──────────────────────────────────────────────────────────────
-# Auth cascade: Keychain password (instant) → SAML/SSO (auto-opens browser).
-# Once save_p4_password stores a password, all auth is fully silent.
+_KEYCHAIN_SERVICE = "p4-workflow"
 
 _TICKET_ERROR_SIGNALS = (
     "ticket has expired",
@@ -52,12 +50,9 @@ _TICKET_ERROR_SIGNALS = (
     "login required",
 )
 
-_KEYCHAIN_SERVICE = "p4-workflow"
-
 
 # ── Keychain helpers (macOS) ─────────────────────────────────────────────────
 def _keychain_read() -> str | None:
-    """Read P4 password from macOS Keychain. Returns None if not stored."""
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-a", P4_USER,
@@ -70,7 +65,6 @@ def _keychain_read() -> str | None:
 
 
 def _keychain_write(password: str) -> bool:
-    """Store P4 password in macOS Keychain. Overwrites any existing entry."""
     subprocess.run(
         ["security", "delete-generic-password", "-a", P4_USER,
          "-s", _KEYCHAIN_SERVICE],
@@ -85,7 +79,6 @@ def _keychain_write(password: str) -> bool:
 
 
 def _login_with_password(password: str) -> bool:
-    """Pipe a password into `p4 login`. Returns True on success."""
     r = subprocess.run(
         [P4_BIN, "login"],
         input=password + "\n",
@@ -95,7 +88,6 @@ def _login_with_password(password: str) -> bool:
 
 
 def _try_keychain_login() -> bool:
-    """Attempt silent login using the password stored in macOS Keychain."""
     pw = _keychain_read()
     if pw and _login_with_password(pw):
         log.info("Auto-logged in from Keychain")
@@ -103,18 +95,23 @@ def _try_keychain_login() -> bool:
     return False
 
 
+# ── P4 environment ──────────────────────────────────────────────────────────
 def _p4_env(client: str | None = None) -> dict:
-    """Build a clean env dict for p4 subprocesses."""
+    """Build a clean env dict for p4 subprocesses.
+
+    Explicitly sets P4PORT, P4USER, P4TICKETS so that both this server
+    and perforce-p4 always share the same ticket file and config.
+    """
     env = os.environ.copy()
     env["P4PORT"] = P4_PORT
     env["P4USER"] = P4_USER
+    env["P4TICKETS"] = P4_TICKETS
     if client:
         env["P4CLIENT"] = client
     return env
 
 
 def _check_ticket() -> tuple[bool, str]:
-    """Run `p4 login -s` once and return (is_valid, status_message)."""
     r = subprocess.run(
         [P4_BIN, "login", "-s"],
         capture_output=True, text=True, env=_p4_env(),
@@ -134,41 +131,25 @@ def _ticket_status() -> str:
 
 
 def _do_saml_login() -> tuple[bool, str]:
-    """Run the full SAML/SSO login: extract URL, open browser, wait for ticket.
-
-    1. Starts `p4 login` which prints a SAML URL
-    2. Auto-opens the URL in the default browser
-    3. Waits for the p4 process to finish (it exits after browser auth completes)
-    4. Verifies the ticket is valid
-
-    Returns (success, human-readable message).
-    """
     proc = subprocess.Popen(
         [P4_BIN, "login"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, env=_p4_env(),
     )
-
     url = None
     for line in iter(proc.stdout.readline, ""):
         if "Navigate to URL:" in line:
             url = line.split("Navigate to URL:", 1)[-1].strip()
             subprocess.Popen(["open", url])
             break
-
     if not url:
         proc.kill()
-        return False, (
-            "p4 login did not output a SAML URL. "
-            "Check that your VPN is connected and P4PORT is reachable."
-        )
-
+        return False, "p4 login did not output a SAML URL. Check VPN."
     try:
         proc.wait(timeout=180)
     except subprocess.TimeoutExpired:
         proc.kill()
         return False, f"Browser login timed out (3 min). Complete manually: {url}"
-
     if _ticket_valid():
         return True, "Logged in via browser SSO."
     return False, f"Browser auth completed but ticket not valid. Retry: {url}"
@@ -180,7 +161,6 @@ def _is_auth_error(msg: str) -> bool:
 
 
 def _ensure_auth() -> None:
-    """Pre-flight: check ticket, auto-login from Keychain if expired. Never raises."""
     ok, status = _check_ticket()
     if ok:
         log.info("Auth OK: %s", status)
@@ -193,7 +173,7 @@ def _ensure_auth() -> None:
 
 # ── P4 command runner ────────────────────────────────────────────────────────
 def _p4(*args: str, client: str | None = None) -> str:
-    """Run a p4 command. Handles all auth automatically — never prompts the user."""
+    """Run a p4 command. Handles all auth automatically."""
     env = _p4_env(client)
     r = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
 
@@ -231,13 +211,6 @@ def _opened_files(changelist_id: int, client: str) -> list[str]:
     return [m.group(1) for line in out.splitlines() if (m := re.match(r"^(//[^#]+)#", line))]
 
 
-def _shelve(changelist_id: int, client: str) -> str:
-    files = _opened_files(changelist_id, client)
-    if not files:
-        raise RuntimeError(f"No open files found in changelist {changelist_id}")
-    return _p4("shelve", "-f", "-c", str(changelist_id), *files, client=client)
-
-
 def _client_for_cl(changelist_id: int) -> str:
     out = _p4("change", "-o", str(changelist_id))
     m = re.search(r"^Client:\t(\S+)", out, re.MULTILINE)
@@ -262,24 +235,74 @@ def _resolve_client(workspace: str | None) -> str:
     return f"{P4_USER}_{workspace}"
 
 
-# ── Swarm layer ─────────────────────────────────────────────────────────────
-# Persistent HTTP client reuses TCP connections across all Swarm calls.
-# Swarm authenticates with (P4USER, p4_ticket) — ticket from `p4 login -p`.
-# The ticket is cached for 20h and auto-refreshes on 401 from Swarm.
+def _pending_cls_raw() -> list[dict]:
+    """Return parsed pending changelists for the current user via p4 -ztag."""
+    out = _p4("-ztag", "changes", "-u", P4_USER, "-s", "pending")
+    cls = []
+    current: dict = {}
+    for line in out.splitlines():
+        m = re.match(r"^\.\.\.\s+(\w+)\s+(.*)", line)
+        if m:
+            key, val = m.group(1), m.group(2)
+            if key == "change" and current:
+                cls.append(current)
+                current = {}
+            current[key] = val
+    if current:
+        cls.append(current)
+    return cls
 
+
+def _shelve(changelist_id: int, client: str) -> str:
+    """Shelve open files. On 'no open files', suggests the user's other pending CLs."""
+    files = _opened_files(changelist_id, client)
+    if not files:
+        other = _pending_cls_raw()
+        suggestions = [
+            c["change"] for c in other
+            if c.get("change") != str(changelist_id) and c.get("client", "") == client
+        ]
+        hint = ""
+        if suggestions:
+            hint = f"\nYour other pending CLs in {client}: {', '.join(suggestions)}. Did you mean one of those?"
+        raise RuntimeError(
+            f"No open files found in changelist {changelist_id}.{hint}"
+        )
+    return _p4("shelve", "-f", "-c", str(changelist_id), *files, client=client)
+
+
+def _cl_for_review(review_id: int) -> int:
+    """Look up the active changelist for a Swarm review via the Swarm API."""
+    status, body = _swarm("get", f"reviews/{review_id}")
+    if status != 200:
+        raise RuntimeError(f"Swarm API returned {status} for review {review_id}: {body}")
+    review = body.get("review", {})
+    changes = review.get("changes") or []
+    if isinstance(changes, int):
+        changes = [changes]
+    if not changes:
+        raise RuntimeError(f"Review {review_id} has no associated changelists.")
+    return changes[-1]
+
+
+def _swarm_review_for_cl(changelist_id: int) -> dict | None:
+    """Find the Swarm review associated with a changelist, if any."""
+    status, body = _swarm("get", f"reviews?change[]={changelist_id}")
+    if status != 200:
+        return None
+    reviews = body.get("reviews", [])
+    return reviews[0] if reviews else None
+
+
+# ── Swarm layer ─────────────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", message=".*Unverified HTTPS.*")
 _http = httpx.Client(verify=False, timeout=30)
 
-_SWARM_TICKET_TTL = 20 * 3600  # 20h (p4 tickets expire in 24h)
+_SWARM_TICKET_TTL = 20 * 3600
 _swarm_ticket_cache: dict = {"value": None, "expires_at": 0.0}
 
 
 def _extract_ticket(raw: str) -> str:
-    """Extract the hex ticket hash from `p4 login -p` output.
-
-    Handles both clean output (just the hash) and noisy output
-    (messages + hash on last non-empty line).
-    """
     for line in reversed(raw.strip().splitlines()):
         stripped = line.strip()
         if re.fullmatch(r"[0-9A-Fa-f]{32,}", stripped):
@@ -288,7 +311,6 @@ def _extract_ticket(raw: str) -> str:
 
 
 def _swarm_ticket(force_refresh: bool = False) -> str:
-    """Return a cached Swarm ticket; refresh only when expired or forced."""
     now = time.monotonic()
     if (
         not force_refresh
@@ -304,7 +326,6 @@ def _swarm_ticket(force_refresh: bool = False) -> str:
 
 
 def _swarm(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
-    """Make a Swarm API call. Caches the ticket and retries once on 401."""
     url = f"{SWARM_API}/{path}"
     for attempt in range(2):
         auth = (P4_USER, _swarm_ticket(force_refresh=(attempt > 0)))
@@ -320,9 +341,7 @@ def _swarm(method: str, path: str, payload: dict | None = None) -> tuple[int, di
             continue
         return resp.status_code, resp.json() if resp.content else {}
 
-    raise RuntimeError(
-        "Swarm authentication failed after ticket refresh."
-    )
+    raise RuntimeError("Swarm authentication failed after ticket refresh.")
 
 
 # ── Startup auth ────────────────────────────────────────────────────────────
@@ -334,19 +353,20 @@ mcp = FastMCP(
     instructions="""
 Single source of truth for Perforce + Swarm workflow -- one tool per task:
 
-  1. create_changelist  -> new CL with full Cisco template against a bug ID
-  2. checkout_file      -> open file(s) for edit in a CL (p4 edit)
-  3. update_description -> update CL description (no char limit)
-  4. update_review      -> after saving code, push new version to Swarm (1 call)
-  5. raise_review       -> first-time: shelve + create Swarm review (1 call)
-  6. add_review_comment -> comment on a review
-  7. get_review_diff    -> fetch full diff + metadata for any Swarm review
-  8. get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
-  9. p4_login           -> check/refresh ticket (usually not needed — auth is automatic)
- 10. save_p4_password   -> one-time: store P4 password in Keychain for silent auth
+  p4_status          -> pre-flight check: auth, workspace, pending CLs, Swarm reachability
+  list_pending_cls   -> your open changelists with file counts
+  create_changelist  -> new CL with full Cisco template against a bug ID
+  checkout_file      -> open file(s) for edit in a CL (p4 edit)
+  update_description -> update CL description (no char limit)
+  push_to_review     -> shelve + raise OR update Swarm review (one call, auto-detects)
+  get_review_diff    -> fetch full diff + metadata for any Swarm review
+  get_review_info    -> fetch metadata + file list for any Swarm review (no diff)
+  add_review_comment -> comment on a review
+  p4_login           -> check/refresh ticket (usually not needed — auth is automatic)
+  save_p4_password   -> one-time: store P4 password in Keychain for silent auth
 
-Workspace (P4CLIENT) is always auto-detected from the changelist.
-Auth is fully automatic — Keychain first, then browser SSO if needed. No manual steps.
+Accepts review_id OR changelist_id — resolves automatically via Swarm API.
+Auth is fully automatic. Workspace is auto-detected from the changelist.
 """,
 )
 
@@ -395,26 +415,103 @@ Documentation:
 {documentation}"""
 
 
+# ── Pre-flight & discovery tools ─────────────────────────────────────────────
+@mcp.tool()
+def p4_status() -> str:
+    """One-shot pre-flight: auth status, workspace, pending CLs, Swarm reachability.
+
+    Call this FIRST before starting any workflow to confirm everything is wired up.
+    """
+    lines: list[str] = []
+
+    ok, ticket_msg = _check_ticket()
+    lines.append(f"Auth:       {'OK' if ok else 'EXPIRED'} — {ticket_msg}")
+    lines.append(f"Server:     {P4_PORT}")
+    lines.append(f"User:       {P4_USER}")
+    lines.append(f"Tickets:    {P4_TICKETS}")
+
+    try:
+        client_out = _p4("set", "P4CLIENT")
+        client = re.sub(r"\s*\(.*?\)\s*$", "", client_out.replace("P4CLIENT=", "")).strip()
+        if client in ("none", "(config)", ""):
+            client = "(not set)"
+    except RuntimeError:
+        client = "(error reading)"
+    lines.append(f"Workspace:  {client}")
+
+    pending = _pending_cls_raw()
+    if pending:
+        lines.append(f"Pending CLs ({len(pending)}):")
+        for c in pending[:15]:
+            desc_first = (c.get("desc", "") or "")[:80]
+            ws = c.get("client", "?")
+            lines.append(f"  CL {c['change']:>8}  [{ws}]  {desc_first}")
+        if len(pending) > 15:
+            lines.append(f"  ... and {len(pending) - 15} more")
+    else:
+        lines.append("Pending CLs: none")
+
+    try:
+        swarm_status, _ = _swarm("get", "version")
+        lines.append(f"Swarm:      {'reachable' if swarm_status == 200 else f'HTTP {swarm_status}'} ({SWARM_URL})")
+    except Exception as e:
+        lines.append(f"Swarm:      unreachable ({e})")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_pending_cls(workspace: str | None = None) -> str:
+    """List your pending changelists, optionally filtered to a specific workspace.
+
+    Shows CL number, workspace, file count, and first line of description.
+
+    Args:
+        workspace: Optional workspace short name to filter (e.g. 'IMS_10_5_MAIN').
+                   Omit to show all workspaces.
+    """
+    client_filter = _resolve_client(workspace) if workspace else None
+    pending = _pending_cls_raw()
+
+    if client_filter:
+        pending = [c for c in pending if c.get("client") == client_filter]
+
+    if not pending:
+        scope = f" in {client_filter}" if client_filter else ""
+        return f"No pending changelists{scope}."
+
+    lines = [f"Pending changelists for {P4_USER} ({len(pending)}):"]
+    for c in pending:
+        cl_id = c["change"]
+        ws = c.get("client", "?")
+        desc_first = (c.get("desc", "") or "")[:80]
+
+        file_count = 0
+        try:
+            opened = _p4("opened", "-c", cl_id, client=ws)
+            file_count = len([l for l in opened.splitlines() if l.strip()])
+        except RuntimeError:
+            pass
+
+        lines.append(f"  CL {cl_id:>8}  [{ws}]  {file_count} files  {desc_first}")
+
+    return "\n".join(lines)
+
+
 # ── Auth tools ───────────────────────────────────────────────────────────────
 @mcp.tool()
 def p4_login() -> str:
     """Check Perforce login status and auto-refresh the ticket if possible.
 
     Auth cascade (fully automatic):
-      1. Already logged in? → done.
-      2. Password in Keychain? → silent refresh → done.
-      3. SAML/SSO → opens browser automatically → waits for completion → done.
-
-    If a password is stored in Keychain (via save_p4_password), the ticket is
-    refreshed automatically. Otherwise opens the SSO URL in your default
-    browser — just complete the auth, everything else is handled.
+      1. Already logged in? -> done.
+      2. Password in Keychain? -> silent refresh -> done.
+      3. SAML/SSO -> opens browser automatically -> waits for completion -> done.
     """
     if _ticket_valid():
         return f"Already logged in. {_ticket_status()}"
-
     if _try_keychain_login():
         return f"Auto-logged in from Keychain. {_ticket_status()}"
-
     ok, msg = _do_saml_login()
     if ok:
         return f"{msg} {_ticket_status()}"
@@ -425,20 +522,14 @@ def p4_login() -> str:
 def save_p4_password(password: str) -> str:
     """Store your Perforce password in macOS Keychain for automatic login renewal.
 
-    This is a one-time setup. After this, every p4 command will silently
-    re-authenticate when the ticket expires — no more manual `p4 login`.
-
-    The password is stored securely in the macOS Keychain under the service
-    name 'p4-workflow' and is never written to disk or logs.
+    One-time setup. After this, all p4 operations auto-renew silently.
+    The password is stored in the macOS Keychain and is never written to disk or logs.
 
     Args:
         password: Your Perforce password (P4PASSWD)
     """
     if not _login_with_password(password):
-        return (
-            "Login failed — check that the password is correct "
-            "and VPN is connected."
-        )
+        return "Login failed — check that the password is correct and VPN is connected."
     if _keychain_write(password):
         return (
             f"Password saved to Keychain and login successful.\n"
@@ -468,7 +559,7 @@ def create_changelist(
 
     Args:
         bug_id:              Bug ID e.g. 'CSCwt43076'
-        workspace:           Workspace short name e.g. '7_4_1_MAIN', 'IMS_7_7_MAIN', 'ims_10_10_MAIN'
+        workspace:           Workspace short name e.g. '7_4_1_MAIN', 'IMS_7_7_MAIN'
         change_description:  What the change does
         root_cause:          Root cause of the bug
         solution:            How the fix works
@@ -479,17 +570,12 @@ def create_changelist(
         mr_local_build:      MR local build done? 'Y' or 'N'
     """
     client = _resolve_client(workspace)
-
     description = _CL_TEMPLATE.format(
-        user=P4_USER,
-        bug_id=bug_id,
+        user=P4_USER, bug_id=bug_id,
         change_description=change_description,
-        root_cause=root_cause,
-        solution=solution,
-        feature_testing=feature_testing,
-        unit_test=unit_test,
-        upgrade_scenario=upgrade_scenario,
-        documentation=documentation,
+        root_cause=root_cause, solution=solution,
+        feature_testing=feature_testing, unit_test=unit_test,
+        upgrade_scenario=upgrade_scenario, documentation=documentation,
         mr_local_build=mr_local_build,
     )
 
@@ -509,35 +595,27 @@ def create_changelist(
     return (
         f"Changelist {cl_id} created in workspace {client}.\n"
         f"Bug: {bug_id} | Template: Cisco IMS\n"
-        f"Next: use checkout_file to open files for edit, then update_review / raise_review."
+        f"Next: use checkout_file to open files for edit, then push_to_review."
     )
 
 
 @mcp.tool()
-def checkout_file(
-    file_path: str,
-    changelist_id: int,
-) -> str:
+def checkout_file(file_path: str, changelist_id: int) -> str:
     """Open a file for edit in a specific changelist (p4 edit).
 
-    Accepts either a local filesystem path OR a depot path -- auto-detects and
-    converts local paths to depot paths using 'p4 where'.
-
-    The workspace (P4CLIENT) is auto-detected from the changelist.
+    Accepts either a local filesystem path OR a depot path -- auto-detects.
+    Workspace is auto-detected from the changelist.
 
     Args:
-        file_path:      Local path (e.g. /Users/you/Perforce/.../foo.pm)
-                        OR depot path (e.g. //depot/firepower/ims/.../foo.pm)
+        file_path:      Local path or depot path (e.g. //depot/.../foo.pm)
         changelist_id:  The changelist to open the file in
     """
     client = _client_for_cl(changelist_id)
-
     if not file_path.startswith("//"):
         where_out = _p4("where", file_path, client=client)
         depot_path = where_out.split()[0]
     else:
         depot_path = file_path
-
     _p4("edit", "-c", str(changelist_id), depot_path, client=client)
     return f"Opened {depot_path} for edit in CL {changelist_id} (workspace: {client})."
 
@@ -546,8 +624,7 @@ def checkout_file(
 def update_description(changelist_id: int, description: str) -> str:
     """Update a changelist description with no character limit.
 
-    Uses 'p4 change -i' directly, bypassing the 2000-char restriction in the
-    official perforce-p4 MCP server.
+    Bypasses the 2000-char restriction in the official perforce-p4 MCP server.
 
     Args:
         changelist_id:  The Perforce changelist number
@@ -572,43 +649,51 @@ def update_description(changelist_id: int, description: str) -> str:
 
 
 @mcp.tool()
-def update_review(changelist_id: int) -> str:
-    """Push your saved code changes to Swarm by force re-shelving the changelist.
-
-    Swarm auto-detects the new shelf and creates a new review version -- no other steps needed.
-    Workspace (P4CLIENT) is auto-detected from the changelist.
-
-    Args:
-        changelist_id: The Perforce changelist number (e.g. 4990352)
-    """
-    client = _client_for_cl(changelist_id)
-    _shelve(changelist_id, client)
-    return (
-        f"CL {changelist_id} re-shelved (workspace: {client}).\n"
-        f"Swarm auto-creates a new review version. Check: {SWARM_URL}"
-    )
-
-
-@mcp.tool()
-def raise_review(
-    changelist_id: int,
+def push_to_review(
+    changelist_id: int | None = None,
+    review_id: int | None = None,
     reviewers: list[str] | None = None,
     required_reviewers: list[str] | None = None,
 ) -> str:
-    """Shelve a changelist AND create a new Swarm review -- in one call.
+    """Shelve + raise OR update a Swarm review -- in one call, auto-detects which.
 
-    The review description is read automatically from the changelist description.
-    Workspace is auto-detected.
+    Accepts EITHER a changelist_id OR a review_id (resolves the CL via Swarm).
+    If a review already exists for this CL, updates it. Otherwise creates a new one.
+    After shelving, polls Swarm to report the exact version number created.
 
     Args:
-        changelist_id:      The Perforce changelist number
-        reviewers:          Optional list of reviewer usernames to add
+        changelist_id:      Perforce changelist number (e.g. 5063715)
+        review_id:          Swarm review ID (e.g. 5063722) -- auto-resolves to the CL
+        reviewers:          Optional list of reviewer usernames
         required_reviewers: Optional list of required reviewer usernames
     """
+    if not changelist_id and not review_id:
+        raise RuntimeError(
+            "Provide either changelist_id or review_id.\n"
+            "Use list_pending_cls to find your active CLs."
+        )
+
+    if review_id and not changelist_id:
+        changelist_id = _cl_for_review(review_id)
+
     client = _client_for_cl(changelist_id)
     _shelve(changelist_id, client)
-    description = _desc_for_cl(changelist_id)
 
+    existing = _swarm_review_for_cl(changelist_id)
+
+    if existing:
+        rid = existing["id"]
+        time.sleep(1)
+        s2, b2 = _swarm("get", f"reviews/{rid}")
+        versions = b2.get("review", {}).get("versions", []) if s2 == 200 else []
+        ver = len(versions) if versions else "?"
+        return (
+            f"Review {rid} updated from CL {changelist_id} (workspace: {client}).\n"
+            f"Version: {ver}\n"
+            f"URL: {SWARM_URL}/reviews/{rid}"
+        )
+
+    description = _desc_for_cl(changelist_id)
     payload: dict = {"change": changelist_id, "description": description}
     if reviewers:
         payload["reviewers"] = reviewers
@@ -619,17 +704,18 @@ def raise_review(
 
     if status == 200:
         review = body["review"]
-        review_id = review["id"]
+        rid = review["id"]
         return (
-            f"Review {review_id} raised from CL {changelist_id} (workspace: {client}).\n"
-            f"URL: {SWARM_URL}/reviews/{review_id}\n"
+            f"Review {rid} created from CL {changelist_id} (workspace: {client}).\n"
+            f"Version: 1\n"
+            f"URL: {SWARM_URL}/reviews/{rid}\n"
             f"State: {review.get('state', 'needsReview')}"
         )
 
     if status == 400 and "already exists" in str(body):
         return (
             f"CL {changelist_id} re-shelved (workspace: {client}).\n"
-            f"Review already exists for this CL -- Swarm auto-versioned it.\n"
+            f"Review already exists — Swarm auto-versioned it.\n"
             f"Check: {SWARM_URL}"
         )
 
@@ -639,9 +725,6 @@ def raise_review(
 @mcp.tool()
 def get_review_diff(review_id: int, max_lines: int = 600) -> str:
     """Fetch the full diff and metadata for any Swarm review.
-
-    Retrieves review info from Swarm then runs p4 describe -S on each shelved
-    changelist to get the actual file diffs.
 
     Args:
         review_id: Swarm review ID (e.g. 4960267)

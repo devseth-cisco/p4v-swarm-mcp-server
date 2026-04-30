@@ -15,6 +15,7 @@
         "P4CLIENT_DEFAULT": "YOUR_USERNAME_YOUR_WORKSPACE",
         "P4_BIN": "/path/to/p4",
         "P4_MCP_SERVER": "/path/to/p4-mcp-server",
+        "P4TICKETS": "/Users/YOUR_USERNAME/.p4tickets",
         "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
       },
       "alwaysAllow": []
@@ -26,6 +27,7 @@
         "P4PORT": "ssl:YOUR_P4_SERVER:1666",
         "P4USER": "YOUR_USERNAME",
         "P4_BIN": "/path/to/p4",
+        "P4TICKETS": "/Users/YOUR_USERNAME/.p4tickets",
         "SWARM_URL": "https://YOUR_SWARM_SERVER",
         "PYTHONPATH": "REPO_DIR/p4-workflow",
         "PATH": "/path/to/p4/dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
