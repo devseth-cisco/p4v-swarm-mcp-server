@@ -14,6 +14,7 @@ Auth architecture (zero-touch):
   3. Swarm: ticket cached 20h; auto-refreshes on 401; extracted from `p4 login -p`
   4. Both servers share P4TICKETS file so perforce-p4 never drifts out of sync
 """
+import fcntl
 import logging
 import os
 import re
@@ -131,6 +132,11 @@ def _ticket_status() -> str:
 
 
 def _do_saml_login() -> tuple[bool, str]:
+    """Run `p4 login`, open the SAML URL in a browser, wait for completion.
+
+    Caller is responsible for ensuring only ONE process invokes this at a
+    time -- use _saml_login_coordinated() instead of calling this directly.
+    """
     proc = subprocess.Popen(
         [P4_BIN, "login"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -153,6 +159,53 @@ def _do_saml_login() -> tuple[bool, str]:
     if _ticket_valid():
         return True, "Logged in via browser SSO."
     return False, f"Browser auth completed but ticket not valid. Retry: {url}"
+
+
+_SAML_LOCK_PATH = f"/tmp/p4-saml-{P4_USER}.lock"
+
+
+def _saml_login_coordinated(timeout_s: int = 180) -> tuple[bool, str]:
+    """Coordinated SAML login -- guarantees only one browser tab opens.
+
+    Uses fcntl.flock on _SAML_LOCK_PATH (the same lock file the
+    perforce-p4/p4-mcp-start.sh wrapper uses via lockf(1)) so the two
+    MCP servers cooperate and the user never sees duplicate SAML tabs
+    when Cursor launches them in parallel.
+
+    Algorithm:
+      1. Try to acquire the lock non-blockingly. If held by another
+         process, poll the ticket file every second -- if it becomes
+         valid we exit early without opening a browser.
+      2. Once we own the lock, re-check the ticket: a sibling may have
+         just refreshed it. If so, skip SAML.
+      3. Otherwise call _do_saml_login() (the only place that opens
+         the browser).
+    """
+    fd = os.open(_SAML_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if _ticket_valid():
+                    return True, "Logged in (sibling MCP server completed SAML)."
+                if time.monotonic() >= deadline:
+                    return False, (
+                        "Timed out waiting for the other MCP server to finish SAML login. "
+                        "Re-run p4_login or restart Cursor."
+                    )
+                time.sleep(1.0)
+        if _ticket_valid():
+            return True, "Logged in (sibling MCP server completed SAML)."
+        return _do_saml_login()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def _is_auth_error(msg: str) -> bool:
@@ -186,7 +239,7 @@ def _p4(*args: str, client: str | None = None) -> str:
                 if r.returncode == 0:
                     return r.stdout.strip()
 
-            ok, login_msg = _do_saml_login()
+            ok, login_msg = _saml_login_coordinated()
             if ok:
                 r = subprocess.run([P4_BIN, *args], capture_output=True, text=True, env=env)
                 if r.returncode == 0:
@@ -512,7 +565,7 @@ def p4_login() -> str:
         return f"Already logged in. {_ticket_status()}"
     if _try_keychain_login():
         return f"Auto-logged in from Keychain. {_ticket_status()}"
-    ok, msg = _do_saml_login()
+    ok, msg = _saml_login_coordinated()
     if ok:
         return f"{msg} {_ticket_status()}"
     return msg
